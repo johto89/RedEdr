@@ -1,10 +1,9 @@
 #pragma once
 
 #include <windows.h>
-#include <iostream>
-#include <sstream>
 #include <vector>
 #include <mutex>
+#include <atomic>
 
 
 class EventAggregator {
@@ -22,24 +21,17 @@ public:
 	void Stop();
 	unsigned int GetCount();
 
-	// Recorder
-	void InitRecorder(std::string filename);
-	void StopRecorder();
-
 	// These is all just so a consumer can get a copy of all new
 	// events (Analyzer)
 	std::condition_variable cv; // Will be called upon each insert
 	std::mutex analyzer_shutdown_mtx;
-	bool done = false;  // Flag to signal when to stop the consumer thread
+	std::atomic<bool> done{false};  // Flag to signal when to stop the consumer thread
 
 private:
 	// JSON should be UTF-8 which is std::string...
 	std::vector<std::string> output_entries;
 	std::mutex output_mutex;
 	unsigned int output_count = 0;
-
-	// Record/Replay
-	FILE* recorder_file = NULL;
 };
 
 extern EventAggregator g_EventAggregator;

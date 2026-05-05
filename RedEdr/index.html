@@ -12,41 +12,26 @@
     <header>
         <div class="container">
             <div class="item">
-                <div id="stats-counter"></div>
-                <div id="detections-counter"></div>
-            </div>
-
-            <div class="item">
-                <div>UI</div>
-                <div><button onclick="BtnRefresh()">Refresh</button></div>
-            </div>
-
-            <div class="item">
-                <div>Server</div>
-                <div><button onclick="BtnSave()">Save Events</button></div>
-                <div><button onclick="BtnReset()">Clear Events</button></div>
+                <div><strong>RedEdr</strong></div>
+                <div><a href="https://github.com/dobin/RedEdr" target="_blank">github.com/dobin/RedEdr</a></div>
             </div>
             <div class="item">
-                <div>Process</div>
-                <div><input type="text" id="trace" placeholder="otepad" oninput="setNewTrace(this.value)"></div>
-            </div>
-            <div class="item">
-                <div>Collection</div>
-                <div><button onclick="BtnStart()">Start</button></div>
-                <div><button onclick="BtnStop()">Stop</button></div>
-            </div>
-            <div class="item">
-                <div>Tabs</div>
-                <div><button onclick="BtnOpenEvents()">Open Events</button></div>
-                <div><button onclick="BtnOpenDetections()">Open Detections</button></div>
+                <div>Target</div>
+                <div><input type="text" id="trace" placeholder="otepad"></div>
+                <div><button onclick="BtnApplyTrace()">Apply</button></div>
             </div>
             <div class="item" id="response">
-                <div>Kernel: <span id="num_kernel">0</span></div>
-                <div>ETW: <span id="num_etw">0</span></div>
-                <div>ETWTI: <span id="num_etwti">0</span></div>
-                <div>DLL: <span id="num_dll">0</span></div>
-                <div>Process Cache: <span id="num_process_cache">0</span></div>
+                <div>Events: <span id="stats-counter">0</span></div>
+                <div id="stat_kernel" style="display:none">Kernel: <span id="num_kernel">0</span></div>
+                <div id="stat_etw" style="display:none">   ETW &nbsp;&nbsp;&nbsp;: <span id="num_etw">0</span></div>
+                <div id="stat_etwti" style="display:none"> ETWTI &nbsp;: <span id="num_etwti">0</span></div>
+                <div id="stat_dll" style="display:none">   DLL &nbsp;&nbsp;&nbsp;: <span id="num_dll">0</span></div>
             </div>
+            <div class="item">
+                <div>Options</div>
+                <div><button onclick="BtnReset()">Clear Events</button></div>
+            </div>
+
         </div>
     </header>
 
@@ -60,9 +45,6 @@
         <div id="tab1" class="tab-content">
             <div id="eventContainer"></div>
         </div>
-        <div id="tab2" class="tab-content" style="display: none;">
-            <div id="detectionContainer"></div>
-        </div>
         <div id="tab3" class="tab-content" style="display: none;">
             <div id="recordingsContainer"></div>
         </div>
@@ -72,10 +54,8 @@
         MyData = {
             "stats": {
                 "events_count": 0,
-                "detections_count": 0,
             },
             "events": [],
-            "detections": []
         }
 
         function showContent(tabId, tabElement) {
@@ -112,21 +92,12 @@
         }
 
         async function fetchEvents() {
-            const response = await fetch('/api/events');
+            const response = await fetch('/api/logs/rededr');
             if (!response.ok) {
                 throw new Error(`HTTP error! Status: ${response.status}`);
             }
             const data = await response.json();
             displayEvents(data);
-        }
-
-        async function fetchDetections() {
-            const response = await fetch('/api/detections');
-            if (!response.ok) {
-                throw new Error(`HTTP error! Status: ${response.status}`);
-            }
-            const data = await response.json();
-            displayDetections(data);
         }
 
         async function fetchStats() {
@@ -139,20 +110,21 @@
             // Check if we need to update something
             if (data.events_count > MyData.stats.events_count) {
                 fetchEvents();
-                fetchDetections();
 
                 // Store new stats
                 MyData.stats = data;
 
                 // Update UI
-                document.getElementById('stats-counter').textContent = `Events: ${data.events_count}`;
-                document.getElementById('detections-counter').textContent = `Detections: ${data.detections_count}`;
+                document.getElementById('stats-counter').textContent = `${data.events_count}`;
 
-                document.getElementById('num_kernel').textContent = `${data.num_kernel}`;
-                document.getElementById('num_etw').textContent = `${data.num_etw}`;
-                document.getElementById('num_etwti').textContent = `${data.num_etwti}`;
-                document.getElementById('num_dll').textContent = `${data.num_dll}`;
-                document.getElementById('num_process_cache').textContent = `${data.num_process_cache}`;
+                function setStat(statId, spanId, value) {
+                    document.getElementById(spanId).textContent = value;
+                    document.getElementById(statId).style.display = value > 0 ? 'block' : 'none';
+                }
+                setStat('stat_kernel', 'num_kernel', data.num_kernel);
+                setStat('stat_etw', 'num_etw', data.num_etw);
+                setStat('stat_etwti', 'num_etwti', data.num_etwti);
+                setStat('stat_dll', 'num_dll', data.num_dll);
             }
         }
 
@@ -174,7 +146,9 @@
         }
 
         async function sendReset() {
-            const response = await fetch('/api/reset');
+            const response = await fetch('/api/trace/reset', {
+                method: 'POST'
+            });
             if (!response.ok) {
                 throw new Error(`HTTP error! Status: ${response.status}`);
             }
@@ -182,7 +156,7 @@
         }
 
         async function sendTrace(name) {
-            const response = await fetch('/api/trace', {
+            const response = await fetch('/api/trace/start', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -194,34 +168,14 @@
             }
         }
 
-        function BtnRefresh() {
-            fetchEvents();
-            fetchDetections();
-        }
-        function BtnSave() {
-            sendSave();
-        }
         function BtnReset() {
             sendReset();
         }
-        function BtnOpenEvents() {
-            window.open('/api/events', '_blank');
+        function BtnApplyTrace() {
+            sendTrace(document.getElementById('trace').value);
         }
-        function BtnOpenDetections() {
-            window.open('/api/detections', '_blank');
-        }
-        function BtnStart() {
-            fetch('/api/start');
-        }
-        function BtnStop() {
-            fetch('/api/stop');
-        }
-
-        function setNewTrace(value) {
-            sendTrace(value);
-        }
-        function setTrace() {
-            fetch('/api/trace')
+        function getTraceTarget() {
+            fetch('/api/trace/info')
                 .then(response => response.json())
                 .then(data => {
                     document.getElementById('trace').value = data.trace;
@@ -233,7 +187,7 @@
         setInterval(fetchStats, 1 * 1000); // periodic check
 
         fetchRecordings();
-        setTrace();
+        getTraceTarget();
     </script>
 
 </body>

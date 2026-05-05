@@ -114,6 +114,7 @@
       <ConformanceMode>true</ConformanceMode>
       <AdditionalIncludeDirectories>$(SolutionDir)RedEdrShared/;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -145,16 +146,17 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\RedEdrShared\etw_krabs.cpp" />
-    <ClCompile Include="..\RedEdrShared\logging.cpp" />
     <ClCompile Include="..\RedEdrShared\loguru.cpp" />
     <ClCompile Include="..\RedEdrShared\piping.cpp" />
+    <ClCompile Include="..\RedEdrShared\myprocess.cpp" />
+    <ClCompile Include="..\RedEdrShared\process_mem_static.cpp" />
+    <ClCompile Include="..\RedEdrShared\process_resolver.cpp" />
     <ClCompile Include="..\RedEdrShared\process_query.cpp" />
     <ClCompile Include="..\RedEdrShared\utils.cpp" />
     <ClCompile Include="event_aggregator.cpp" />
     <ClCompile Include="event_augmenter.cpp" />
-    <ClCompile Include="event_detector.cpp" />
     <ClCompile Include="event_processor.cpp" />
-    <ClCompile Include="executor.cpp" />
+    <ClCompile Include="logging.cpp" />
     <ClCompile Include="manager.cpp" />
     <ClCompile Include="config.cpp" />
     <ClCompile Include="dllinjector.cpp" />
@@ -163,26 +165,20 @@
     <ClCompile Include="dllreader.cpp" />
     <ClCompile Include="kernelreader.cpp" />
     <ClCompile Include="logreader.cpp" />
-    <ClCompile Include="mem_dynamic.cpp" />
-    <ClCompile Include="mem_static.cpp" />
     <ClCompile Include="pplmanager.cpp" />
     <ClCompile Include="pplreader.cpp" />
-    <ClCompile Include="process.cpp" />
-    <ClCompile Include="processinfo.cpp" />
-    <ClCompile Include="process_resolver.cpp" />
+    <ClCompile Include="privileges.cpp" />
     <ClCompile Include="RedEdr.cpp" />
     <ClCompile Include="serviceutils.cpp" />
     <ClCompile Include="webserver.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\RedEdrShared\logging.h" />
-    <ClInclude Include="..\RedEdrShared\loguru.hpp" />
+    <ClInclude Include="loguru.hpp" />
     <ClInclude Include="event_aggregator.h" />
     <ClInclude Include="event_augmenter.h" />
-    <ClInclude Include="event_detector.h" />
     <ClInclude Include="event_processor.h" />
-    <ClInclude Include="executor.h" />
     <ClInclude Include="jsonw.hpp" />
+    <ClInclude Include="logging.h" />
     <ClInclude Include="manager.h" />
     <ClInclude Include="config.h" />
     <ClInclude Include="cxxops.hpp" />
@@ -193,12 +189,9 @@
     <ClInclude Include="dllreader.h" />
     <ClInclude Include="kernelreader.h" />
     <ClInclude Include="logreader.h" />
-    <ClInclude Include="mem_dynamic.h" />
-    <ClInclude Include="mem_static.h" />
     <ClInclude Include="pplmanager.h" />
     <ClInclude Include="pplreader.h" />
-    <ClInclude Include="process.h" />
-    <ClInclude Include="process_resolver.h" />
+    <ClInclude Include="privileges.h" />
     <ClInclude Include="serviceutils.h" />
     <ClInclude Include="webserver.h" />
   </ItemGroup>
@@ -212,9 +205,6 @@
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
     </None>
     <None Include="packages.config" />
-    <None Include="recording.html">
-      <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
-    </None>
     <None Include="shared.js">
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
     </None>

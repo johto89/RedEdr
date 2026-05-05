@@ -1,19 +1,12 @@
 #pragma once
 #include <windows.h>
-#include <evntrace.h>
-#include <tdh.h>
-#include <iostream>
 #include <vector>
 #include <string>
-#include <iomanip>
-#include <sstream>
-#include <tchar.h>
 
 
 class Config {
 public:
-	std::string targetExeName = "powershell.exe";
-	BOOL enabled = TRUE;
+	std::vector<std::string> targetProcessNames = {"malware"};
 	bool debug = false;
 
 	// Constants
@@ -26,16 +19,18 @@ public:
 	bool web_output = false;
 	bool log_unload = false;
 	bool do_udllinjection = false;
-	bool replay_events = false;
 	bool debug_dllreader = false;
 	bool enable_remote_exec = true;
 
 	// Input selection
 	bool do_etw = false;
 	bool do_etwti = false;
-	bool do_mplog = false;
-	bool do_kernelcallback = false;
-	bool do_dllinjection = false;
+	bool do_kernel = false; // kernel module loaded (set by --kernel or --hook)
+	bool do_hook = false;   // kernel module + DLL injection/hooking (set by --hook)
+	
+	// More input
+	bool do_defendertrace = false;
+	bool do_antimalwareengine = false;
 	bool do_dllinjection_ucallstack = true;
 
 	// ETW input selection

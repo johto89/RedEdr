@@ -20,20 +20,29 @@
 typedef struct _MY_DRIVER_DATA {
     wchar_t filename[TARGET_WSTR_LEN];
     int enable;
-    int dll_inject;
+    int enable_dll_injection;
+    int enable_etwti_events;
+    int enable_etwti_events_defender;
 } MY_DRIVER_DATA, * PMY_DRIVER_DATA;
 
-#define REDEDR_VERSION "0.4"
+#define REDEDR_VERSION "1.0"
 
 #define DRIVER_KERNEL_PIPE_NAME L"\\??\\pipe\\RedEdrKrnCom"
 #define KERNEL_PIPE_NAME L"\\\\.\\pipe\\RedEdrKrnCom"
 #define DLL_PIPE_NAME L"\\\\.\\pipe\\RedEdrDllCom"
 
 #define PPL_SERVICE_PIPE_NAME L"\\\\.\\pipe\\RedEdrPplService"
+#define PPL_DATA_PIPE_NAME L"\\\\.\\pipe\\RedEdrPplData"
 #define SERVICE_NAME  L"RedEdrPplService"
 
 #define DRIVER_NAME L"c:\\RedEdr\\elam_driver.sys"
 
 #define MAX_CALLSTACK_ENTRIES 8
+
+
+#define LOG_ERROR 0
+#define LOG_WARNING 1
+#define LOG_INFO 2
+#define LOG_DEBUG 3
 
 #endif

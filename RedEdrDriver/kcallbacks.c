@@ -1,50 +1,306 @@
 #include <Ntifs.h>
 #include <ntddk.h>
-#include <wdf.h>
-#include <string.h>
-#include <stdio.h>
-#include <fltkernel.h>
+#include <ntstrsafe.h>
 
 #include "upipe.h"
 #include "kapcinjector.h"
 #include "kcallbacks.h"
 #include "hashcache.h"
-#include "hashcache.h"
 #include "settings.h"
 #include "utils.h"
 #include "../Shared/common.h"
 
+// ZwSetInformationProcess is exported by ntoskrnl but not declared in WDK headers.
+// Resolved dynamically via MmGetSystemRoutineAddress to avoid VCR001 analyzer warnings.
+// ProcessLoggingInformation (class 87) sets per-process ETW-TI logging flags so that
+// the Microsoft-Windows-Threat-Intelligence provider emits the full range of events
+// (WriteVM, ReadVM, SetContextThread, SuspendThread, etc.) for this process.
+// Reference: https://fluxsec.red/reverse-engineering-windows-11-kernel
+typedef NTSTATUS (NTAPI *PFN_ZwSetInformationProcess)(
+    HANDLE ProcessHandle,
+    ULONG  ProcessInformationClass,
+    PVOID  ProcessInformation,
+    ULONG  ProcessInformationLength
+);
+static PFN_ZwSetInformationProcess g_ZwSetInformationProcess = NULL;
 
-char* ProcessLine;
-char* ImageLine;
-char* ThreadLine;
+typedef NTSTATUS (NTAPI *PFN_ZwQueryInformationProcess)(
+    HANDLE ProcessHandle,
+    ULONG  ProcessInformationClass,
+    PVOID  ProcessInformation,
+    ULONG  ProcessInformationLength,
+    PULONG ReturnLength
+);
+static PFN_ZwQueryInformationProcess g_ZwQueryInformationProcess = NULL;
+
+typedef NTSTATUS (NTAPI *PFN_ZwQuerySystemInformation)(
+    ULONG  SystemInformationClass,
+    PVOID  SystemInformation,
+    ULONG  SystemInformationLength,
+    PULONG ReturnLength
+);
+static PFN_ZwQuerySystemInformation g_ZwQuerySystemInformation = NULL;
+
+// PROCESS_LOGGING_INFORMATION
+// based on https://www.legacyy.xyz/defenseevasion/windows/2024/04/24/disabling-etw-ti-without-ppl.html
+#define ProcessLoggingInformation 96  // 0x60  
+
+typedef union _PROCESS_LOGGING_INFORMATION {
+    ULONG Flags;
+    struct _PROCESS_LOGGING_INFORMATION_BITS {
+        ULONG EnableReadVmLogging              : 1;
+        ULONG EnableWriteVmLogging             : 1;
+        ULONG EnableProcessSuspendResumeLogging: 1;
+        ULONG EnableThreadSuspendResumeLogging : 1;
+        ULONG EnableLocalExecProtectVmLogging  : 1;
+        ULONG EnableRemoteExecProtectVmLogging : 1;
+        ULONG EnableImpersonationLogging       : 1;
+        ULONG Reserved                         : 25;
+    } Bits;
+} PROCESS_LOGGING_INFORMATION;
+
+// Enable all ETW-TI logging flags for the given process.
+// Must be called at PASSIVE_LEVEL (process-creation callbacks run at PASSIVE_LEVEL).
+// Returns TRUE on success, FALSE on failure.
+static BOOLEAN EnableProcessTelemetryLogging(PEPROCESS Process) {
+    HANDLE hProcess = NULL;
+    NTSTATUS status;
+    BOOLEAN success = FALSE;
+
+    // Convert EPROCESS pointer to a kernel HANDLE without a separate ZwOpenProcess.
+    status = ObOpenObjectByPointer(
+        Process,
+        OBJ_KERNEL_HANDLE,
+        NULL,
+        PROCESS_ALL_ACCESS,
+        *PsProcessType,
+        KernelMode,
+        &hProcess
+    );
+    if (!NT_SUCCESS(status)) {
+        LOG_A(LOG_WARNING, "[RedEdr] EnableProcessTelemetryLogging: ObOpenObjectByPointer failed: 0x%08X\n", status);
+        return FALSE;
+    }
+
+    // Set the desired logging flags for this process. We enable all the ETW-TI flags to get the full range of events.
+    PROCESS_LOGGING_INFORMATION processLoggingInfo = { 0 };
+    processLoggingInfo.Bits.EnableReadVmLogging = 1;
+    processLoggingInfo.Bits.EnableWriteVmLogging = 1;
+    processLoggingInfo.Bits.EnableProcessSuspendResumeLogging = 1;
+    processLoggingInfo.Bits.EnableThreadSuspendResumeLogging = 1;
+    // Win11 only (build >= 22000); these bits are not present on Win10
+    RTL_OSVERSIONINFOW osVer = {0};
+    osVer.dwOSVersionInfoSize = sizeof(osVer);
+    if (NT_SUCCESS(RtlGetVersion(&osVer)) && osVer.dwBuildNumber >= 22000) {
+        LOG_A(LOG_INFO, "Detected Windows 11");
+        processLoggingInfo.Bits.EnableLocalExecProtectVmLogging = 1;
+        processLoggingInfo.Bits.EnableRemoteExecProtectVmLogging = 1;
+        //processLoggingInfo.Bits.EnableImpersonationLogging = 1;
+    }
+    // Dont touch reserved for now
+    //processLoggingInfo.Bits.Reserved = 0;
+
+    if (g_ZwSetInformationProcess == NULL) {
+        ZwClose(hProcess);
+        return FALSE;
+    }
+    status = g_ZwSetInformationProcess(
+        hProcess,
+        ProcessLoggingInformation,
+        &processLoggingInfo,
+        sizeof(processLoggingInfo)
+    );
+    if (!NT_SUCCESS(status)) {
+        LOG_A(LOG_WARNING, "[RedEdr] EnableProcessTelemetryLogging: ZwSetInformationProcess failed: 0x%08X\n", status);
+        success = FALSE;
+    } else {
+        success = TRUE;
+    }
+
+    ZwClose(hProcess);
+    return success;
+}
+
+// Query and debug-log the current PROCESS_LOGGING_INFORMATION flags for a process.
+static void LogProcessTelemetryLoggingFlags(PEPROCESS Process, HANDLE pid) {
+    HANDLE hProcess = NULL;
+    NTSTATUS status;
+
+    status = ObOpenObjectByPointer(
+        Process,
+        OBJ_KERNEL_HANDLE,
+        NULL,
+        PROCESS_ALL_ACCESS,
+        *PsProcessType,
+        KernelMode,
+        &hProcess
+    );
+    if (!NT_SUCCESS(status)) {
+        LOG_A(LOG_INFO, "[RedEdr] LogProcessTelemetryLoggingFlags: ObOpenObjectByPointer failed for pid %llu: 0x%08X\n", (ULONG64)pid, status);
+        return;
+    }
+
+    if (g_ZwQueryInformationProcess == NULL) {
+        ZwClose(hProcess);
+        return;
+    }
+
+    PROCESS_LOGGING_INFORMATION loggingInfo = { 0 };
+    ULONG returnLength = 0;
+    status = g_ZwQueryInformationProcess(
+        hProcess,
+        ProcessLoggingInformation,
+        &loggingInfo,
+        sizeof(loggingInfo),
+        &returnLength
+    );
+    ZwClose(hProcess);
+
+    if (!NT_SUCCESS(status)) {
+        LOG_A(LOG_INFO, "[RedEdr] LogProcessTelemetryLoggingFlags: ZwQueryInformationProcess failed for pid %llu: 0x%08X\n", (ULONG64)pid, status);
+        return;
+    }
+
+    LOG_A(LOG_INFO, "[RedEdr] pid %llu ETW-TI flags=0x%02X: ReadVM=%d WriteVM=%d ProcSuspRes=%d ThrSuspRes=%d LocalExecProt=%d RemoteExecProt=%d Impersonation=%d reserved=0x%02X\n",
+        (ULONG64)pid,
+        loggingInfo.Flags,
+        loggingInfo.Bits.EnableReadVmLogging,
+        loggingInfo.Bits.EnableWriteVmLogging,
+        loggingInfo.Bits.EnableProcessSuspendResumeLogging,
+        loggingInfo.Bits.EnableThreadSuspendResumeLogging,
+        loggingInfo.Bits.EnableLocalExecProtectVmLogging,
+        loggingInfo.Bits.EnableRemoteExecProtectVmLogging,
+        loggingInfo.Bits.EnableImpersonationLogging,
+        loggingInfo.Bits.Reserved);
+}
+
+
+// Enumerate all running processes and call EnableProcessTelemetryLogging for
+// every process whose image name matches targetName (case-insensitive).
+// Uses ZwQuerySystemInformation(SystemProcessInformation) to walk the live
+// process list without relying on the driver's own hash table, so it works
+// even for processes that were already running before the driver loaded.
+VOID EnableTelemetryLoggingForProcessByName(PCWSTR targetName) {
+#define SystemProcessInformation 5
+    typedef struct _SYSTEM_PROCESS_INFORMATION {
+        ULONG           NextEntryOffset;
+        ULONG           NumberOfThreads;
+        LARGE_INTEGER   Reserved[3];
+        LARGE_INTEGER   CreateTime;
+        LARGE_INTEGER   UserTime;
+        LARGE_INTEGER   KernelTime;
+        UNICODE_STRING  ImageName;
+        KPRIORITY       BasePriority;
+        HANDLE          UniqueProcessId;
+        HANDLE          InheritedFromUniqueProcessId;
+        ULONG           HandleCount;
+        ULONG           SessionId;
+        ULONG_PTR       PageDirectoryBase;
+        SIZE_T          PeakVirtualSize;
+        SIZE_T          VirtualSize;
+        ULONG           PageFaultCount;
+        SIZE_T          PeakWorkingSetSize;
+        SIZE_T          WorkingSetSize;
+        SIZE_T          QuotaPeakPagedPoolUsage;
+        SIZE_T          QuotaPagedPoolUsage;
+        SIZE_T          QuotaPeakNonPagedPoolUsage;
+        SIZE_T          QuotaNonPagedPoolUsage;
+        SIZE_T          PagefileUsage;
+        SIZE_T          PeakPagefileUsage;
+        SIZE_T          PrivatePageCount;
+        LARGE_INTEGER   ReadOperationCount;
+        LARGE_INTEGER   WriteOperationCount;
+        LARGE_INTEGER   OtherOperationCount;
+        LARGE_INTEGER   ReadTransferCount;
+        LARGE_INTEGER   WriteTransferCount;
+        LARGE_INTEGER   OtherTransferCount;
+    } SYSTEM_PROCESS_INFORMATION, *PSYSTEM_PROCESS_INFORMATION;
+
+    ULONG bufferSize = 1024 * 1024; // 1 MB initial allocation
+    PVOID buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, bufferSize, 'PrEn');
+    if (buffer == NULL) {
+        LOG_A(LOG_WARNING, "[RedEdr] EnableTelemetryLoggingForProcessByName: allocation failed\n");
+        return;
+    }
+
+    if (g_ZwQuerySystemInformation == NULL) {
+        LOG_A(LOG_WARNING, "[RedEdr] EnableTelemetryLoggingForProcessByName: ZwQuerySystemInformation not resolved\n");
+        ExFreePool(buffer);
+        return;
+    }
+    ULONG returnLength = 0;
+    NTSTATUS status = g_ZwQuerySystemInformation(
+        SystemProcessInformation,
+        buffer,
+        bufferSize,
+        &returnLength
+    );
+    if (!NT_SUCCESS(status)) {
+        LOG_A(LOG_WARNING, "[RedEdr] EnableTelemetryLoggingForProcessByName: ZwQuerySystemInformation failed 0x%08X\n", status);
+        ExFreePool(buffer);
+        return;
+    }
+
+    PSYSTEM_PROCESS_INFORMATION entry = (PSYSTEM_PROCESS_INFORMATION)buffer;
+    for (;;) {
+        // ImageName.Buffer may be NULL for the idle/system processes
+        if (entry->ImageName.Buffer != NULL && entry->ImageName.Length > 0) {
+            UNICODE_STRING targetUs;
+            RtlInitUnicodeString(&targetUs, targetName);
+            if (RtlEqualUnicodeString(&entry->ImageName, &targetUs, TRUE)) {
+                HANDLE pid = entry->UniqueProcessId;
+                PEPROCESS process = NULL;
+                status = PsLookupProcessByProcessId(pid, &process);
+                if (NT_SUCCESS(status)) {
+                    BOOLEAN ok = EnableProcessTelemetryLogging(process);
+                    LOG_A(LOG_INFO, "[RedEdr] EnableTelemetryLoggingForProcessByName: pid %llu -> %d\n",
+                        (ULONG64)pid, ok);
+                    ObDereferenceObject(process);
+                } else {
+                    LOG_A(LOG_WARNING, "[RedEdr] EnableTelemetryLoggingForProcessByName: PsLookupProcessByProcessId pid %llu failed 0x%08X\n",
+                        (ULONG64)pid, status);
+                }
+            }
+        }
+
+        if (entry->NextEntryOffset == 0) {
+            break;
+        }
+        entry = (PSYSTEM_PROCESS_INFORMATION)((PUCHAR)entry + entry->NextEntryOffset);
+    }
+
+    ExFreePool(buffer);
+}
 
 
 int InitCallbacks() {
-    ProcessLine = ExAllocatePool2(POOL_FLAG_NON_PAGED, DATA_BUFFER_SIZE, 'log');
-    if (ProcessLine == NULL) {
-        return FALSE;
+    UNICODE_STRING funcName;
+    RtlInitUnicodeString(&funcName, L"ZwSetInformationProcess");
+    g_ZwSetInformationProcess = (PFN_ZwSetInformationProcess)MmGetSystemRoutineAddress(&funcName);
+    if (g_ZwSetInformationProcess == NULL) {
+        LOG_A(LOG_WARNING, "[RedEdr] InitCallbacks: failed to resolve ZwSetInformationProcess\n");
     }
-    ImageLine = ExAllocatePool2(POOL_FLAG_NON_PAGED, DATA_BUFFER_SIZE, 'log');
-    if (ImageLine == NULL) {
-        return FALSE;
+
+    RtlInitUnicodeString(&funcName, L"ZwQueryInformationProcess");
+    g_ZwQueryInformationProcess = (PFN_ZwQueryInformationProcess)MmGetSystemRoutineAddress(&funcName);
+    if (g_ZwQueryInformationProcess == NULL) {
+        LOG_A(LOG_WARNING, "[RedEdr] InitCallbacks: failed to resolve ZwQueryInformationProcess\n");
     }
-    ThreadLine = ExAllocatePool2(POOL_FLAG_NON_PAGED, DATA_BUFFER_SIZE, 'log');
-    if (ThreadLine == NULL) {
-        return FALSE;
+
+    RtlInitUnicodeString(&funcName, L"ZwQuerySystemInformation");
+    g_ZwQuerySystemInformation = (PFN_ZwQuerySystemInformation)MmGetSystemRoutineAddress(&funcName);
+    if (g_ZwQuerySystemInformation == NULL) {
+        LOG_A(LOG_WARNING, "[RedEdr] InitCallbacks: failed to resolve ZwQuerySystemInformation\n");
     }
     return TRUE;
 }
 
 void UninitCallbacks() {
-    ExFreePool(ProcessLine);
-    ExFreePool(ImageLine);
-    ExFreePool(ThreadLine);
 }
 
 
 // For: PsSetCreateProcessNotifyRoutineEx()
-void CreateProcessNotifyRoutine(PEPROCESS parent_process, HANDLE pid, PPS_CREATE_NOTIFY_INFO createInfo) {
+void CreateProcessNotifyRoutine(PEPROCESS process, HANDLE pid, PPS_CREATE_NOTIFY_INFO createInfo) {
     // Still execute even if we are globally disabled, but need kapc injection
     if (!g_Settings.enable_logging && !g_Settings.enable_kapc_injection) {
         return;
@@ -60,16 +316,15 @@ void CreateProcessNotifyRoutine(PEPROCESS parent_process, HANDLE pid, PPS_CREATE
 
     PPROCESS_INFO processInfo = LookupProcessInfo(pid);
     if (processInfo == NULL) {
-        PEPROCESS process = NULL;
         PUNICODE_STRING processName = NULL;
+        PUNICODE_STRING parent_processName = NULL;
 
-        PsLookupProcessByProcessId(pid, &process);
         SeLocateProcessImageName(process, &processName);
 
-
-        PsLookupProcessByProcessId(createInfo->ParentProcessId, &parent_process);
-        PUNICODE_STRING parent_processName = NULL;
-        SeLocateProcessImageName(parent_process, &parent_processName);
+        PEPROCESS parent_process = NULL;
+        if (NT_SUCCESS(PsLookupProcessByProcessId(createInfo->ParentProcessId, &parent_process))) {
+            SeLocateProcessImageName(parent_process, &parent_processName);
+        }
 
         //LOG_A(LOG_INFO, "[RedEdr] Process %wZ created\n", processName);
         //LOG_A(LOG_INFO, "            PID: %d\n", pid);
@@ -83,6 +338,9 @@ void CreateProcessNotifyRoutine(PEPROCESS parent_process, HANDLE pid, PPS_CREATE
 
         processInfo = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(PROCESS_INFO), 'Proc');
         if (!processInfo) {
+            if (processName) ExFreePool(processName);
+            if (parent_processName) ExFreePool(parent_processName);
+            if (parent_process) ObDereferenceObject(parent_process);
             return;
         }
 
@@ -109,11 +367,17 @@ void CreateProcessNotifyRoutine(PEPROCESS parent_process, HANDLE pid, PPS_CREATE
         //    pid, processInfo->observe);
 
         AddProcessInfo(pid, processInfo);
+
+        // Release kernel object references and pool allocations from SeLocateProcessImageName
+        if (processName) ExFreePool(processName);
+        if (parent_processName) ExFreePool(parent_processName);
+        if (parent_process) ObDereferenceObject(parent_process);
     }
 
     if (g_Settings.enable_logging && processInfo->observe) {
         char processName[PROC_NAME_LEN];
         char parentName[PROC_NAME_LEN];
+        char ProcessLine[DATA_BUFFER_SIZE];
 
         NTSTATUS status;
         status = WcharToAscii(processInfo->name, wcslen(processInfo->name), processName, sizeof(processName));
@@ -121,7 +385,7 @@ void CreateProcessNotifyRoutine(PEPROCESS parent_process, HANDLE pid, PPS_CREATE
         JsonEscape(processName, PROC_NAME_LEN);
         JsonEscape(parentName, PROC_NAME_LEN);
 
-        sprintf(ProcessLine, "{\"type\":\"kernel\",\"time\":%llu,\"func\":\"process_create\",\"krn_pid\":%llu,\"pid\":%llu,\"name\":\"%s\",\"ppid\":%llu,\"parent_name\":\"%s\"}",
+        RtlStringCbPrintfA(ProcessLine, DATA_BUFFER_SIZE, "{\"type\":\"kernel\",\"time\":%llu,\"func\":\"process_create\",\"krn_pid\":%llu,\"pid\":%llu,\"name\":\"%s\",\"ppid\":%llu,\"parent_name\":\"%s\"}",
             systemTime,
             (unsigned __int64)PsGetCurrentProcessId(),
             (unsigned __int64)pid, 
@@ -129,6 +393,21 @@ void CreateProcessNotifyRoutine(PEPROCESS parent_process, HANDLE pid, PPS_CREATE
             (unsigned __int64)createInfo->ParentProcessId, 
             parentName);
         LogEvent(ProcessLine);
+
+        // Log current ETW-TI flags before modifying them.
+        LogProcessTelemetryLoggingFlags(process, pid);
+
+        // Enable all ETW-TI logging flags so Microsoft-Windows-Threat-Intelligence
+        // emits the full range of events (ReadVM, WriteVM, SetContextThread, etc.)
+        // for this process. Applied to all new processes; RedEdrPplService filters
+        // by observe flag. Must run at PASSIVE_LEVEL - process callbacks qualify.
+        if (g_Settings.enable_etwti_events) {
+            BOOLEAN etwtiEnabledSuccess = EnableProcessTelemetryLogging(process);
+            LOG_A(LOG_INFO, "Enabled ETW-TI logging for pid %d: %d\n", pid, etwtiEnabledSuccess);
+        }
+
+        // Log ETW-TI flags after modification to confirm they were set correctly.
+        LogProcessTelemetryLoggingFlags(process, pid);
     }
 }
 
@@ -146,7 +425,8 @@ void CreateThreadNotifyRoutine(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create
     ULONG64 systemTime;
     KeQuerySystemTime(&systemTime);
 
-    sprintf(ThreadLine, "{\"type\":\"kernel\",\"time\":%llu,\"func\":\"thread_create\",\"krn_pid\":%llu,\"pid\":%llu,\"threadid\":%llu,\"create\":%d}",
+    char ThreadLine[DATA_BUFFER_SIZE];
+    RtlStringCbPrintfA(ThreadLine, DATA_BUFFER_SIZE, "{\"type\":\"kernel\",\"time\":%llu,\"func\":\"thread_create\",\"krn_pid\":%llu,\"pid\":%llu,\"threadid\":%llu,\"create\":%d}",
         systemTime,
         (unsigned __int64)PsGetCurrentProcessId(),
         (unsigned __int64)ProcessId,
@@ -180,7 +460,8 @@ void LoadImageNotifyRoutine(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIM
             Unicodestring2wcharAlloc(FullImageName, ImageName, PATH_LEN);
             WcharToAscii(ImageName, sizeof(ImageName), AsciiImageName, sizeof(AsciiImageName));
             JsonEscape(AsciiImageName, sizeof(AsciiImageName));
-            sprintf(ImageLine, "{\"type\":\"kernel\",\"time\":%llu,\"func\":\"image_load\",\"krn_pid\":%llu,\"pid\":%llu,\"image\":\"%s\"}",
+            char ImageLine[DATA_BUFFER_SIZE];
+            RtlStringCbPrintfA(ImageLine, DATA_BUFFER_SIZE, "{\"type\":\"kernel\",\"time\":%llu,\"func\":\"image_load\",\"krn_pid\":%llu,\"pid\":%llu,\"image\":\"%s\"}",
                 systemTime,
                 (unsigned __int64)PsGetCurrentProcessId(),
                 (unsigned __int64)ProcessId,
@@ -191,11 +472,16 @@ void LoadImageNotifyRoutine(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIM
     }
     if (g_Settings.enable_kapc_injection) {
         PPROCESS_INFO processInfo = LookupProcessInfo(ProcessId);
-        if (processInfo != NULL && processInfo->observe && !processInfo->injected) {
-            processInfo->injected = KapcInjectDll(FullImageName, ProcessId, ImageInfo);
-            // TODO lock this?
-            if (processInfo->injected) {
-                LOG_A(LOG_INFO, "Injected DLL into pid: %d\n", ProcessId);
+        if (processInfo != NULL && processInfo->observe) {
+            // Atomically claim injection: only the first thread to succeed injects.
+            if (InterlockedCompareExchange(&processInfo->injected, 1, 0) == 0) {
+                int result = KapcInjectDll(FullImageName, ProcessId, ImageInfo);
+                if (result) {
+                    LOG_A(LOG_INFO, "Injected DLL into pid: %d\n", ProcessId);
+                } else {
+                    // Reset so injection can be retried on the next image load.
+                    InterlockedExchange(&processInfo->injected, 0);
+                }
             }
         }
     }
@@ -367,7 +653,7 @@ OB_PREOP_CALLBACK_STATUS CBTdPreOperationCallback(
     //
     // Set call context.
     //
-
+    // TODO necessary?
     TdSetCallContext(PreInfo, CallbackRegistration);
 
 
@@ -379,7 +665,7 @@ OB_PREOP_CALLBACK_STATUS CBTdPreOperationCallback(
 
     if (1) {
         char line[DATA_BUFFER_SIZE] = { 0 };
-        sprintf(line, "%p:%p;%p;%ls;%ls;%d,0x%x,0x%x,0x%x",
+        RtlStringCbPrintfA(line, DATA_BUFFER_SIZE, "%p:%p;%p;%ls;%ls;%d,0x%x,0x%x,0x%x",
             /*"ObCallbackTest: CBTdPreOperationCallback\n"
             "    Client Id:    %p:%p\n"
             "    Object:       %p\n"

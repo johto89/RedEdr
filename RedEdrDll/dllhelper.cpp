@@ -1,14 +1,11 @@
 #include "dllhelper.h"
 #include "../Shared/common.h"
-#include <winternl.h>  // needs to be on bottom?
 #include <dbghelp.h>
-#include <stdio.h>
 #include <thread>
 #include <mutex>
 
 #include "piping.h"
 #include "logging.h"
-#include "utils.h"
 #include "process_query.h"
 
 #pragma comment(lib, "dbghelp.lib")
@@ -24,7 +21,7 @@ config Config;
 // The pipe to RedEdr.exe
 // Read first message as config,
 // then send all the data
-PipeClient pipeClient;
+PipeClient pipeClient("RedEdrDll Emitter");
 
 typedef enum _MEMORY_INFORMATION_CLASS {
     MemoryBasicInformation

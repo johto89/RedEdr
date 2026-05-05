@@ -1,3 +1,12 @@
+#include <vector>
+#include <algorithm>
+#include <locale>
+#include <sstream>
+#include <iostream>
+#include <fstream>
+#include <ctime>
+#include <iomanip>
+#include <string>
 
 #include "utils.h"
 #include "../Shared/common.h"
@@ -36,12 +45,17 @@ PVOID uint64_to_pointer(uint64_t i) {
 	return ptr;
 }
 
-std::string wchar2string(const wchar_t* wstr) {
-    if (!wstr) return {};
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
-    std::string str(size_needed - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &str[0], size_needed, nullptr, nullptr);
-    return str;
+std::string wchar2string(const wchar_t* wideString) {
+    if (!wideString) {
+        return "";
+    }
+    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wideString, -1, nullptr, 0, nullptr, nullptr);
+    if (sizeNeeded <= 0) {
+        return "";
+    }
+    std::string ret(sizeNeeded - 1, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wideString, -1, &ret[0], sizeNeeded, nullptr, nullptr);
+    return ret;
 }
 
 // FIXME copy from dll
@@ -69,7 +83,8 @@ std::wstring to_lowercase(const std::wstring& str) {
 
 std::string to_lowercase2(const std::string& str) {
     std::string lower_str = str;
-    std::transform(lower_str.begin(), lower_str.end(), lower_str.begin(), ::towlower);
+    std::transform(lower_str.begin(), lower_str.end(), lower_str.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
     return lower_str;
 }
 
@@ -103,16 +118,26 @@ bool contains_case_insensitive(const std::string& haystack, const std::string& n
 }
 
 
+bool ends_with_case_insensitive(const std::string& str, const std::string& suffix) {
+    if (suffix.size() > str.size()) {
+        return false;
+    }
+    std::string str_lower = to_lowercase2(str);
+    std::string suffix_lower = to_lowercase2(suffix);
+    return str_lower.compare(str_lower.size() - suffix_lower.size(), suffix_lower.size(), suffix_lower) == 0;
+}
+
+
 // Dear mother of god whats up with all these goddamn string types
 wchar_t* string2wcharAlloc(const std::string& str) {
     if (str.empty()) {
-        wchar_t* empty = new wchar_t[1];
-        empty[0] = L'\0';
-        return empty;
+        wchar_t* wideString = new wchar_t[1];
+        wideString[0] = L'\0';
+        return wideString;
     }
     int sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
     if (sizeNeeded <= 0) {
-        throw std::runtime_error("Error converting string to wchar_t*");
+        return nullptr;
     }
     wchar_t* wideString = new wchar_t[sizeNeeded];
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, wideString, sizeNeeded);
@@ -422,32 +447,24 @@ DWORD StartProcessInBackground(LPCWSTR exePath, LPCWSTR commandLine) {
     else {
         // Print error and return 0 if process creation failed
         std::wcerr << L"Failed to start process. Error: " << GetLastError() << std::endl;
+        //LOG_W(LOG_ERROR, L"Failed to start process. Error: %d", GetLastError());
         return 0;
     }
 }
 
 
-wchar_t* char2wcharAlloc(char* charStr) {
-    size_t charStrLen = std::strlen(charStr) + 1; // Include null terminator
-
-    // Allocate wchar_t buffer
-    wchar_t* wcharStr = new wchar_t[charStrLen];
-    size_t convertedChars = 0;
-
-    // Convert using mbstowcs_s
-    errno_t result = mbstowcs_s(&convertedChars, wcharStr, charStrLen, charStr, charStrLen - 1);
-    if (result != 0) {
-        std::cerr << "Conversion failed with error code: " << result << std::endl;
-        delete[] wcharStr;
-        return NULL;
+wchar_t* char2wcharAlloc(const char* charStr) {
+    if (!charStr) {
+        return nullptr;
     }
-    return wcharStr;
-}
-wchar_t* char2wcharAlloc_Backup(const char* arg) {
-    int len = MultiByteToWideChar(CP_ACP, 0, arg, -1, NULL, 0);
-    wchar_t* wargv = new wchar_t[len];
-    MultiByteToWideChar(CP_ACP, 0, arg, -1, wargv, len);
-    return wargv;
+    int sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, charStr, -1, nullptr, 0);
+    if (sizeNeeded <= 0) {
+        // You might want to throw an exception or handle the error in another way
+        return nullptr;
+    }
+    wchar_t* wideString = new wchar_t[sizeNeeded];
+    MultiByteToWideChar(CP_UTF8, 0, charStr, -1, wideString, sizeNeeded);
+    return wideString;
 }
 
 

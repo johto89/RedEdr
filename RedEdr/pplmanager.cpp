@@ -1,61 +1,111 @@
 #include <stdio.h>
 #include <Windows.h>
-//#include "ppl_runner.h"
-#include <cstdio>
 
 #include "logging.h"
 #include "../Shared/common.h"
 #include "serviceutils.h"
 #include "pplmanager.h"
 #include "piping.h"
-#include "utils.h"
-
+#include "json.hpp"
 
 
 // PplManager: Interact with the PPL service 
 //   load elam driver, install/enable/disable service
 
 
-PipeClient pipeClient;
+PipeClient pipeClient("RedEdr PplManager");
 
 BOOL StartPplService();
 BOOL InstallPplService();
 BOOL InstallElamCertPpl();
 
 
-BOOL EnablePplProducer(BOOL e, std::string targetName) {
-    char buffer[PPL_CONFIG_LEN] = { 0 };
-
+BOOL ConnectPplService() {
     if (!pipeClient.Connect(PPL_SERVICE_PIPE_NAME)) {
         LOG_A(LOG_ERROR, "ETW-TI: Error connecting to RedEdrPplService pipe: error code %ld", GetLastError());
         LOG_A(LOG_ERROR, "ETW-TI: Is RedEdrPplService running?");
         LOG_A(LOG_ERROR, "ETW-TI:   (requires self-signed kernel and elam driver for ppl)");
         return FALSE;
     }
-
-    // Send enable/disable via pipe to PPL aervice
-    if (e) {
-        sprintf_s(buffer, PPL_CONFIG_LEN, "start:%s", targetName.c_str());
-        if (!pipeClient.Send(buffer)) {
-            LOG_A(LOG_INFO, "ETW-TI: Error sending: %s to ppl service", buffer);
-            return FALSE;
-        }
-        LOG_A(LOG_INFO, "ETW-TI: ppl reader: Enabled");
-    }
-    else {
-        sprintf_s(buffer, PPL_CONFIG_LEN, "%s", L"stop");
-        if (!pipeClient.Send(buffer)) {
-            return FALSE;
-        }
-        LOG_A(LOG_INFO, "ETW-TI: ppl reader: Disabled");
-    }
-
-    pipeClient.Disconnect();
-    return TRUE;
+	return TRUE;
 }
 
 
-BOOL InitPplService() {
+BOOL EnablePplProducer(BOOL e, std::vector<std::string> targetNames, bool doDefenderTrace) {
+    char buffer[PPL_CONFIG_LEN] = { 0 };
+    if (targetNames.empty()) {
+        LOG_A(LOG_WARNING, "ETW-TI: No target names provided to EnablePplProducer");
+		return FALSE;
+    }
+
+    try {
+        // Create JSON object with target names
+        nlohmann::json j;
+        j["command"] = "start";
+        j["targets"] = targetNames;
+        j["do_defendertrace"] = doDefenderTrace;
+        
+        std::string json_str = j.dump();
+        
+        // Validate JSON string length to prevent buffer overflow
+        if (json_str.length() >= (PPL_CONFIG_LEN - 1)) {
+            LOG_A(LOG_ERROR, "ETW-TI: JSON payload too long: %zu characters", json_str.length());
+            return FALSE;
+        }
+        
+        // Copy JSON string to buffer
+        strncpy_s(buffer, PPL_CONFIG_LEN, json_str.c_str(), _TRUNCATE);
+
+        // Send JSON via pipe to PPL service
+        if (!pipeClient.Send(buffer)) {
+            LOG_A(LOG_INFO, "ETW-TI: Error sending JSON to ppl service: %s", buffer);
+            return FALSE;
+        }
+        LOG_A(LOG_DEBUG, "ETW-TI: ppl reader: Enabled with targets JSON");
+        
+        return TRUE;
+    }
+    catch (const std::exception& ex) {
+        LOG_A(LOG_ERROR, "ETW-TI: JSON serialization error: %s", ex.what());
+        return FALSE;
+    }
+}
+
+
+BOOL DisablePplProducer() {
+    char buffer[PPL_CONFIG_LEN] = { 0 };
+    
+    try {
+        // Create JSON object for shutdown command
+        nlohmann::json j;
+        j["command"] = "stop";
+        
+        std::string json_str = j.dump();
+        
+        // Validate JSON string length
+        if (json_str.length() >= (PPL_CONFIG_LEN - 1)) {
+            LOG_A(LOG_ERROR, "ETW-TI: Stop JSON payload too long: %zu characters", json_str.length());
+            return FALSE;
+        }
+        
+        // Copy JSON string to buffer
+        strncpy_s(buffer, PPL_CONFIG_LEN, json_str.c_str(), _TRUNCATE);
+        
+        if (!pipeClient.Send(buffer)) {
+            LOG_A(LOG_ERROR, "ETW-TI: Error writing stop JSON to named pipe: %ld", GetLastError());
+            return FALSE;
+        }
+        LOG_A(LOG_INFO, "ETW-TI: ppl reader: Disabled");
+        return TRUE;
+    }
+    catch (const std::exception& ex) {
+        LOG_A(LOG_ERROR, "ETW-TI: JSON serialization error for stop: %s", ex.what());
+        return FALSE;
+    }
+}
+
+
+BOOL StartThePplService() {
     if (!DoesServiceExist(SERVICE_NAME)) {
         LOG_A(LOG_WARNING, "ETW-TI: service %ls not found", SERVICE_NAME);
         LOG_A(LOG_WARNING, "ETW-TI: Attempting to load elam driver");
@@ -70,25 +120,43 @@ BOOL InitPplService() {
         LOG_A(LOG_WARNING, "ETW-TI: Attempting to start ppl service");
         InstallElamCertPpl(); // have to do this upon reboot
         StartPplService();
-        Sleep(500);  // wait for it to start
+        Sleep(1000);  // wait for it to start
     }
     return TRUE;
 }
 
 
 BOOL ShutdownPplService() {
-    PipeClient pipeClient;
-    if (!pipeClient.Connect(PPL_SERVICE_PIPE_NAME)) {
-        LOG_A(LOG_ERROR, "ETW-TI: Error creating named pipe: %ld", GetLastError());
+	LOG_A(LOG_INFO, "ETW-TI: ShutdownPplService()");
+    char buffer[PPL_CONFIG_LEN] = { 0 };
+    
+    try {
+        // Create JSON object for shutdown command
+        nlohmann::json j;
+        j["command"] = "shutdown";
+        
+        std::string json_str = j.dump();
+        
+        // Validate JSON string length
+        if (json_str.length() >= (PPL_CONFIG_LEN - 1)) {
+            LOG_A(LOG_ERROR, "ETW-TI: Shutdown JSON payload too long: %zu characters", json_str.length());
+            return FALSE;
+        }
+        
+        // Copy JSON string to buffer
+        strncpy_s(buffer, PPL_CONFIG_LEN, json_str.c_str(), _TRUNCATE);
+        
+        if (!pipeClient.Send(buffer)) {
+            LOG_A(LOG_ERROR, "ETW-TI: Error writing shutdown JSON to named pipe: %ld", GetLastError());
+            return FALSE;
+        }
+        pipeClient.Disconnect();
+        return TRUE;
+    }
+    catch (const std::exception& ex) {
+        LOG_A(LOG_ERROR, "ETW-TI: JSON serialization error for shutdown: %s", ex.what());
         return FALSE;
     }
-    const char* s = "shutdown";
-    if (!pipeClient.Send((char*)s)) {
-        LOG_A(LOG_ERROR, "ETW-TI: Error writing to named pipe: %ld", GetLastError());
-        return FALSE;
-    }
-    pipeClient.Disconnect();
-    return TRUE;
 }
 
 
@@ -114,10 +182,12 @@ BOOL InstallElamCertPpl()
 
     if (InstallELAMCertificateInfo(fileHandle) == FALSE) {
         LOG_A(LOG_ERROR, "ETW-TI: install_elam_cert: install_elam_certificateInfo Error: %d", GetLastError());
+        CloseHandle(fileHandle);
         return FALSE;
     }
     LOG_A(LOG_INFO, "ETW-TI: install_elam_cert: Installed ELAM driver cert");
 
+    CloseHandle(fileHandle);
     return TRUE;
 }
 
@@ -159,10 +229,10 @@ BOOL InstallPplService()
         retval = GetLastError();
         if (retval == ERROR_SERVICE_EXISTS) {
             LOG_A(LOG_INFO, "ETW-TI: install_service: CreateService: Service '%ls' Already Exists", SERVICE_NAME);
-            //LOG_A(LOG_INFO, "[PPL_RUNNER] install_service: Run 'net start %s' to start the service", SERVICE_NAME);
         }
         else {
             LOG_A(LOG_ERROR, "ETW-TI: install_service: CreateService Error: %d", retval);
+            CloseServiceHandle(hSCManager);
             return FALSE;
         }
     }
@@ -171,11 +241,15 @@ BOOL InstallPplService()
         info.dwLaunchProtected = SERVICE_LAUNCH_PROTECTED_ANTIMALWARE_LIGHT;
         if (ChangeServiceConfig2(hService, SERVICE_CONFIG_LAUNCH_PROTECTED, &info) == FALSE) {
             LOG_A(LOG_ERROR, "ETW-TI: install_service: ChangeServiceConfig2 Error: %d", GetLastError());
+            CloseServiceHandle(hService);
+            CloseServiceHandle(hSCManager);
             return FALSE;
         }
+        CloseServiceHandle(hService);
     }
 
     LOG_A(LOG_INFO, "ETW-TI: install_service: Created Service: %ls", serviceCMD);
+    CloseServiceHandle(hSCManager);
     return TRUE;
 }
 
@@ -203,6 +277,8 @@ BOOL StartPplService()
     bSuccess = StartService(hService, 0, NULL);
     if (!bSuccess) {
         retval = GetLastError();
+        CloseServiceHandle(hService);
+        CloseServiceHandle(hSCManager);
         if (retval == ERROR_SERVICE_ALREADY_RUNNING) {
             LOG_A(LOG_WARNING, "ETW-TI: Service is already running");
             return TRUE;

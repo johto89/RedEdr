@@ -7,17 +7,15 @@
 #include "event_processor.h"
 #include "event_aggregator.h"
 #include "event_augmenter.h"
-#include "event_detector.h"
 #include "utils.h"
 #include "config.h"
 #include "../Shared/common.h"
-
+#include "logging.h"
 
 /* event_processor.c: Gets new events from EventAggregator and processes them
  *   Keeps stats
  *   Keeps copy of all events
  *   Augments events with additional information
- *   Perform the detections
  *   Query process for more information
  */
 
@@ -49,136 +47,117 @@ void EventProcessor::init() {
 
 	j["do_etw"] = g_Config.do_etw;
 	j["do_etwti"] = g_Config.do_etwti;
-	j["do_mplog"] = g_Config.do_mplog;
-	j["do_kernelcallback"] = g_Config.do_kernelcallback;
-	j["do_dllinjection"] = g_Config.do_dllinjection;
-	j["do_dllinjection_ucallstack"] = g_Config.do_dllinjection_ucallstack;
+	j["do_kernel"] = g_Config.do_kernel;
+	j["do_hook"] = g_Config.do_hook;
+	j["do_hook_callstack"] = g_Config.do_dllinjection_ucallstack;
 	    
-	j["target"] = g_Config.targetExeName;
+	j["targets"] = g_Config.targetProcessNames;
     json_entries.push_back(j);
 }
 
 
-void EventProcessor::InitialProcessInfo(Process *process) {
-    if (process->GetHandle() == NULL) {
-        LOG_A(LOG_WARNING, "EventProcessor: Cant access Process pid %lu",
-            process->id);
-    }
-    DWORD exitCode;
-    GetExitCodeProcess(process->GetHandle(), &exitCode);
-    if (exitCode != STILL_ACTIVE) {
-        LOG_A(LOG_WARNING, "EventProcessor: Cant access Process pid %lu",
-            process->id);
-        return;
-    }
-
+void EventProcessor::LogInitialProcessInfo(Process *process) {
     // Log: Peb Info
-    ProcessPebInfoRet processPebInfoRet = ProcessPebInfo(process->GetHandle());
-	nlohmann::json j;
-	j["type"] = "process_query";
-	j["func"] = "peb";
-	j["time"] = get_time();
-	j["id"] = process->id;
-	j["parent_pid"] = processPebInfoRet.parent_pid;
-	j["image_path"] = processPebInfoRet.image_path;
-	j["commandline"] = processPebInfoRet.commandline;
-	j["working_dir"] = processPebInfoRet.working_dir;
-	j["is_debugged"] = processPebInfoRet.is_debugged;
-	j["is_protected_process"] = processPebInfoRet.is_protected_process;
-	j["is_protected_process_light"] = processPebInfoRet.is_protected_process_light;
-	j["image_base"] = processPebInfoRet.image_base;
-    g_EventAggregator.NewEvent(j.dump());
+    ProcessPebInfoRet processPebInfoRet = process->processPebInfoRet;
+    try {
+        nlohmann::json j;
+		j["pid"] = process->id;
+        j["type"] = "process_query";
+        j["func"] = "peb";
+        j["time"] = get_time();
+        j["id"] = process->id;
+        j["parent_pid"] = processPebInfoRet.parent_pid;
+        j["image_path"] = processPebInfoRet.image_path;
+        j["commandline"] = processPebInfoRet.commandline;
+        j["working_dir"] = processPebInfoRet.working_dir;
+        j["is_debugged"] = processPebInfoRet.is_debugged;
+        j["is_protected_process"] = processPebInfoRet.is_protected_process;
+        j["is_protected_process_light"] = processPebInfoRet.is_protected_process_light;
+        j["image_base"] = processPebInfoRet.image_base;
+        g_EventAggregator.NewEvent(j.dump());
+    }
+    catch (const std::exception& e) {
+        LOG_A(LOG_ERROR, "EventProcessor: Error creating PEB info JSON: %s", e.what());
+    }
 
     // Log: Loaded Modules Info
-    std::vector<ProcessLoadedDll> processLoadedDlls = ProcessEnumerateModules(process->GetHandle());
-	nlohmann::json jDlls;
-    jDlls["func"] = "loaded_dll";
-    jDlls["type"] = "process_query";
-	jDlls["time"] = get_time();
-	jDlls["pid"] = process->id;
-    jDlls["dlls"] = {};
-    for (auto dllEntry : processLoadedDlls) {
-		jDlls["dlls"] += {
-			{"addr", dllEntry.dll_base},
-			{"size", dllEntry.size},
-			{"name", dllEntry.name}
-		};
-    }
-	std::string jsonStr = jDlls.dump();
-    remove_all_occurrences_case_insensitive(jsonStr, "C:\\\\Windows\\\\system32\\\\");
-	g_EventAggregator.NewEvent(jsonStr);
-    
-    // DB: MemStatic
-    for (auto processLoadedDll : processLoadedDlls) {
-        std::vector<ModuleSection> moduleSections = EnumerateModuleSections(
-            process->GetHandle(), 
-            uint64_to_pointer(processLoadedDll.dll_base));
-        for (auto moduleSection : moduleSections) {
-            MemoryRegion* memoryRegion = new MemoryRegion(
-                moduleSection.name,
-                moduleSection.addr, 
-                moduleSection.size, 
-                moduleSection.protection);
-            g_MemStatic.AddMemoryRegion(memoryRegion->addr, memoryRegion);
+    try {
+        std::vector<ProcessLoadedDll> processLoadedDlls = process->processLoadedDlls;
+        nlohmann::json jDlls;
+        jDlls["func"] = "loaded_dll";
+        jDlls["type"] = "process_query";
+        jDlls["time"] = get_time();
+        jDlls["pid"] = process->id;
+        jDlls["dlls"] = {};
+        for (auto dllEntry : processLoadedDlls) {
+            jDlls["dlls"] += {
+                {"addr", dllEntry.dll_base},
+                {"size", dllEntry.size},
+                {"name", dllEntry.name}
+            };
         }
+        std::string jsonStr = jDlls.dump();
+        remove_all_occurrences_case_insensitive(jsonStr, "C:\\\\Windows\\\\system32\\\\");
+        g_EventAggregator.NewEvent(jsonStr);
+    }
+    catch (const std::exception& e) {
+        LOG_A(LOG_ERROR, "EventProcessor: Error enumerating modules: %s", e.what());
     }
 }
 
 
 void EventProcessor::AnalyzeEventJson(nlohmann::json& j) {
-    j["id"] = json_entries.size();
-    j["trace_id"] = trace_id;
+    try {
+        j["id"] = json_entries.size();
+        j["trace_id"] = trace_id;
 
-    // Sanity checks
-    if (!j.contains("type")) {
-        LOG_A(LOG_WARNING, "No type? %s", j.dump().c_str());
-        return;
-    }
+        // Sanity checks
+        if (!j.contains("type")) {
+            LOG_A(LOG_WARNING, "No type? %s", j.dump().c_str());
+            return;
+        }
+        //if (!j.contains("pid")) {
+        //    LOG_A(LOG_WARNING, "No pid? %s", j.dump().c_str());
+        //    return;
+        //}
 
-    // Stats (for UI)
-    EventStats(j);
+        // Stats (for UI)
+        EventStats(j);
 
-    // Handle if we see the pid the first time, by augmenting our internal data structures
-    if (j.contains("pid") && !g_Config.replay_events) {
-        Process* process = g_ProcessResolver.getObject(j["pid"].get<DWORD>());
-
-        // Check if the process is initialized (ready to be queried by us)
-        if (!process->initialized) {
-            // If we receive on of these, its for sure initialized
-            // If we only do kernel callbacks, it will never be initialized. (But nobody uses that)
-            // Also, we just need the info we gather for ETW and DLL events anyway
-            if (j["type"] == "etw" || j["type"] == "dll") {
-                process->initialized = true;
+		// etw_pid is typically the source process of the event
+        if (j.contains("etw_pid") && !j["etw_pid"].is_null()) {
+            Process* process = g_ProcessResolver.getObject(j["etw_pid"].get<DWORD>());
+            if (process == nullptr) {
+                // Should not happen
+                LOG_A(LOG_WARNING, "EventProcessor: Failed to get process object for pid %lu", j["etw_pid"].get<DWORD>());
+                return;
             }
+
+            // Check if we need to gather the detailed information about the process
+            // If yes (not done before), do it and log it
+            if (!process->augmented) {
+                process->AugmentInfo();
+                process->augmented = true;
+                LogInitialProcessInfo(process);
+            }
+
+            // Augment the JSON Event with memory info
+            AugmentEventWithMemAddrInfo(j, process);
         }
 
-        // If process is ready (not early kernel events), gather information
-        if (process->augmented == 0 && process->initialized) {
-            process->augmented++;
-            InitialProcessInfo(process);
-        }
+        // Print Event
+        PrintEvent(j);
+
+        // Has to be at the end as we dont store reference
+        json_entries.push_back(j);
+        event_count++;
     }
-
-    // Augment Event with memory info
-    AugmentEventWithMemAddrInfo(j);
-
-    // Check if we should skip as its our own DLL patching
-    if (EventHasOurDllCallstack(j)) {
-        return;
+    catch (const nlohmann::json::exception& e) {
+        LOG_A(LOG_ERROR, "JSON error in AnalyzeEventJson: %s", e.what());
     }
-
-    // Track Memory changes of Event (MemDynamic)
-    g_EventDetector.ScanEventForMemoryChanges(j);
-
-    // Perform Detections on Event
-    g_EventDetector.ScanEventForDetections(j);
-
-    // Print Event
-    PrintEvent(j);
-
-    // Has to be at the end as we dont store reference
-    json_entries.push_back(j);
-    event_count++;
+    catch (const std::exception& e) {
+        LOG_A(LOG_ERROR, "Error in AnalyzeEventJson: %s", e.what());
+    }
 
     return;
 }
@@ -239,7 +218,7 @@ void EventProcessor::EventStats(nlohmann::json& j) {
         num_dll += 1;
     }
     else if (j["type"] == "etw") {
-        if (j["provider_name"] == "Microsoft-Windows-Threat-Intelligence") {
+        if (j["etw_provider_name"] == "Microsoft-Windows-Threat-Intelligence") {
             num_etwti += 1;
         }
         else {
@@ -265,54 +244,93 @@ std::string EventProcessor::GetAllAsJson() {
 
 
 void EventProcessor::SaveToFile() {
-    std::string data = GetAllAsJson();
-    std::string filename = "C:\\RedEdr\\Data\\" + get_time_for_file() + ".events.json";
-    write_file(filename, data);
+    try {
+        std::string data = GetAllAsJson();
+        std::string filename = "C:\\RedEdr\\Data\\" + get_time_for_file() + ".events.json";
+        write_file(filename, data);
+        LOG_A(LOG_INFO, "EventProcessor: Saved events to %s", filename.c_str());
+    }
+    catch (const std::exception& e) {
+        LOG_A(LOG_ERROR, "EventProcessor: Error saving events to file: %s", e.what());
+    }
 }
 
 
 // Module functions
 HANDLE EventProcessor_thread;
+HANDLE hStopEventProcessor = NULL; // signaled to request thread stop
 
 
 // Thread which retrieves and processes events from EventAggregator
 DWORD WINAPI EventProcessorThread(LPVOID param) {
-    LOG_A(LOG_INFO, "!EventProcessor: Start thread");
-    size_t arrlen = 0;
-    std::unique_lock<std::mutex> lock(g_EventAggregator.analyzer_shutdown_mtx);
+    try {
+        size_t arrlen = 0;
+        std::unique_lock<std::mutex> lock(g_EventAggregator.analyzer_shutdown_mtx);
 
-    while (true) {
-        // Block for new events
-        g_EventAggregator.cv.wait(lock, [] { return g_EventAggregator.HasMoreEvents() || g_EventAggregator.done; });
-        if (g_EventAggregator.done) {
-            break;
+        while (true) {
+            // Block for new events
+            g_EventAggregator.cv.wait(lock, [] { return g_EventAggregator.HasMoreEvents() || g_EventAggregator.done; });
+            if (g_EventAggregator.done) {
+                break;
+            }
+            // get em events
+            std::vector<std::string> new_entries = g_EventAggregator.GetEvents();
+
+            // process
+            g_EventProcessor.AnalyzeNewEvents(new_entries);
         }
-        // get em events
-        std::vector<std::string> new_entries = g_EventAggregator.GetEvents();
-
-        // process
-        g_EventProcessor.AnalyzeNewEvents(new_entries);
+    }
+    catch (const std::exception& e) {
+        LOG_A(LOG_ERROR, "EventProcessorThread: Exception in main loop: %s", e.what());
+    }
+    catch (...) {
+        LOG_A(LOG_ERROR, "EventProcessorThread: Unknown exception in main loop");
     }
 
-    LOG_A(LOG_INFO, "!EventProcessor: Exit thread");
+    LOG_A(LOG_DEBUG, "!EventProcessor: Thread finished");
     return 0;
 }
 
 
 int InitializeEventProcessor(std::vector<HANDLE>& threads) {
-    EventProcessor_thread = CreateThread(NULL, 0, EventProcessorThread, NULL, 0, NULL);
-    if (EventProcessor_thread == NULL) {
-        LOG_A(LOG_ERROR, "WEB: Failed to create thread for EventProcessor");
+    hStopEventProcessor = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (hStopEventProcessor == NULL) {
+        LOG_A(LOG_ERROR, "EventProcessor: Failed to create stop event");
         return 1;
     }
+    EventProcessor_thread = CreateThread(NULL, 0, EventProcessorThread, NULL, 0, NULL);
+    if (EventProcessor_thread == NULL) {
+        LOG_A(LOG_ERROR, "EventProcessor: Failed to create thread for EventProcessor");
+        CloseHandle(hStopEventProcessor);
+        hStopEventProcessor = NULL;
+        return 1;
+    }
+    LOG_A(LOG_DEBUG, "!EventProcessor: Thread started");
+
     threads.push_back(EventProcessor_thread);
     return 0;
 }
 
 
 void StopEventProcessor() {
+    // Signal stop
+    if (hStopEventProcessor != NULL) {
+        SetEvent(hStopEventProcessor);
+    }
+
     if (EventProcessor_thread != NULL) {
         g_EventAggregator.Stop();
+
+        if (WaitForSingleObject(EventProcessor_thread, 5000) == WAIT_TIMEOUT) {
+            LOG_A(LOG_WARNING, "EventProcessor: Thread did not exit in time, force-terminating");
+            TerminateThread(EventProcessor_thread, 1);
+        }
+        // handle ownership stays with the threads vector; do not close here
+    }
+
+    if (hStopEventProcessor != NULL) {
+        CloseHandle(hStopEventProcessor);
+        hStopEventProcessor = NULL;
     }
 }
 

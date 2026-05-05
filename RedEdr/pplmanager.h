@@ -1,12 +1,14 @@
 #pragma once
 
-#include <stdio.h>
 #include <Windows.h>
+#include <string>
+#include <vector>
 
+BOOL ConnectPplService();
 BOOL InstallElamCertPpl();
 BOOL InstallPplService();
-BOOL EnablePplProducer(BOOL e, std::string target_name);
-BOOL InitPplService();
+BOOL EnablePplProducer(BOOL e, std::vector<std::string> targetNames, bool doDefenderTrace = false);
+BOOL StartThePplService();
 BOOL ShutdownPplService();
-
+BOOL DisablePplProducer();
 BOOL remove_ppl_service();

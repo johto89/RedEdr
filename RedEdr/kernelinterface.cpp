@@ -1,17 +1,9 @@
-#include <stdio.h>
 #include <windows.h>
-#include <cwchar>
-#include <cstdlib>
-#include <string.h>
-#include <stdio.h>
 #include <winioctl.h>
-
 #include "../Shared/common.h"
 
 #include "logging.h"
 #include "config.h"
-#include "process_query.h"
-#include "dllinjector.h"
 #include "kernelinterface.h"
 #include "utils.h"
 
@@ -19,53 +11,115 @@
 // KernelInterface: Functions to interact with the kernel driver (load/unload, enable/disable)
 
 
-BOOL EnableKernelDriver(int enable, std::string target) {
-    HANDLE hDevice = CreateFile(L"\\\\.\\RedEdr",
-        GENERIC_READ | GENERIC_WRITE,
-        0,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL);
+BOOL ConfigureKernelDriver(int enable) {
+    HANDLE hDevice = INVALID_HANDLE_VALUE;
+    wchar_t* targetW = nullptr;
 
-    if (hDevice == INVALID_HANDLE_VALUE) {
-        LOG_A(LOG_ERROR, "Kernel: Failed to open device. Error: %d", GetLastError());
+    if (g_Config.targetProcessNames.empty()) {
+        LOG_A(LOG_ERROR, "Kernel: No target process specified for kernel driver");
         return FALSE;
     }
-    wchar_t* targetW = string2wcharAlloc(target);
-    MY_DRIVER_DATA dataToSend = { 0 };
+    std::string target = g_Config.targetProcessNames[0];
+    
+    try {
+        hDevice = CreateFile(L"\\\\.\\RedEdr",
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
+
+        if (hDevice == INVALID_HANDLE_VALUE) {
+            LOG_A(LOG_ERROR, "Kernel: Failed to open device. Error: %d", GetLastError());
+            return FALSE;
+        }
+        
+        targetW = string2wcharAlloc(target);
+        if (targetW == nullptr) {
+            LOG_A(LOG_ERROR, "Kernel: Failed to convert target string to wchar_t");
+            CloseHandle(hDevice);
+            return FALSE;
+        }
+    MY_DRIVER_DATA kernel_config = { 0 };
     if (enable) {
-        wcscpy_s(dataToSend.filename, targetW);
-        dataToSend.dll_inject = g_Config.do_dllinjection;
-        dataToSend.enable = enable;
+        size_t targetLen = wcslen(targetW);
+        if (targetLen >= sizeof(kernel_config.filename) / sizeof(wchar_t)) {
+            LOG_A(LOG_ERROR, "Kernel: Target filename too long");
+            delete[] targetW;
+            CloseHandle(hDevice);
+            return FALSE;
+        }
+        wcscpy_s(kernel_config.filename, sizeof(kernel_config.filename) / sizeof(wchar_t), targetW);
+        kernel_config.enable_dll_injection = g_Config.do_hook;
+        kernel_config.enable = enable;
+
+        if (g_Config.do_etwti) {
+            kernel_config.enable_etwti_events = 1;
+            if (g_Config.do_defendertrace) {
+                kernel_config.enable_etwti_events_defender = 1;
+            } else {
+                kernel_config.enable_etwti_events_defender = 0;
+            }
+        } else {
+            kernel_config.enable_etwti_events = 0;
+            kernel_config.enable_etwti_events_defender = 0;
+        }
+
+        // Log
+        LOG_A(LOG_INFO, "Kernel: enable=%d, dll_injection=%d, etwti_events=%d, etwti_events_defender=%d, filename=%ls",
+            kernel_config.enable,
+            kernel_config.enable_dll_injection,
+            kernel_config.enable_etwti_events,
+            kernel_config.enable_etwti_events_defender,
+            kernel_config.filename);
     }
     else {
-        dataToSend.enable = 0;
+        kernel_config.enable = 0;        
+        kernel_config.enable_etwti_events = 0;
+        kernel_config.enable_etwti_events_defender = 0;
     }
+    delete[] targetW;  // Free allocated memory
     char buffer_incoming[KRN_CONFIG_LEN] = { 0 }; // Answer will be "OK" or "FAIL" so this is enough
     DWORD bytesReturned = 0;
     BOOL success = DeviceIoControl(hDevice,
         IOCTL_MY_IOCTL_CODE,
-        (LPVOID)&dataToSend,
-        (DWORD)sizeof(dataToSend),
-        buffer_incoming,
-        sizeof(buffer_incoming), // this should get the correct size
-        &bytesReturned,
-        NULL);
-    if (!success) {
-        LOG_A(LOG_ERROR, "Kernel: DeviceIoControl failed. Error: %d", GetLastError());
-        CloseHandle(hDevice);
-        return FALSE;
-    }
+            (LPVOID)&kernel_config,
+            (DWORD)sizeof(kernel_config),
+            buffer_incoming,
+            sizeof(buffer_incoming), // this should get the correct size
+            &bytesReturned,
+            NULL);
+        if (!success) {
+            LOG_A(LOG_ERROR, "Kernel: DeviceIoControl failed. Error: %d", GetLastError());
+            CloseHandle(hDevice);
+            return FALSE;
+        }
 
-    if (strcmp(buffer_incoming, "OK") == NULL) {
-        LOG_A(LOG_INFO, "Kernel: Kernel Driver enabling/disabling (%d) ok", enable);
-        CloseHandle(hDevice);
-        return TRUE;
+        if (bytesReturned == 0) {
+            LOG_A(LOG_ERROR, "Kernel: DeviceIoControl returned no data");
+            CloseHandle(hDevice);
+            return FALSE;
+        }
+
+        // Ensure null termination
+        buffer_incoming[min(bytesReturned, sizeof(buffer_incoming) - 1)] = '\0';
+
+        if (strcmp(buffer_incoming, "OK") == 0) {
+            LOG_A(LOG_INFO, "Kernel: Kernel Driver enabling/disabling (%d) ok", enable);
+            CloseHandle(hDevice);
+            return TRUE;
+        }
+        else {
+            LOG_A(LOG_ERROR, "Kernel: Kernel Driver enabling/disabling (%d) failed. Response: %s", enable, buffer_incoming);
+            CloseHandle(hDevice);
+            return FALSE;
+        }
     }
-    else {
-        LOG_A(LOG_ERROR, "Kernel: Kernel Driver enabling/disabling (%d) failed", enable);
-        CloseHandle(hDevice);
+    catch (const std::exception& e) {
+        LOG_A(LOG_ERROR, "Kernel: Exception in ConfigureKernelDriver: %s", e.what());
+        if (targetW) delete[] targetW;
+        if (hDevice != INVALID_HANDLE_VALUE) CloseHandle(hDevice);
         return FALSE;
     }
 }
@@ -124,22 +178,24 @@ BOOL LoadKernelDriver() {
         if (GetLastError() != ERROR_SERVICE_ALREADY_RUNNING) {
             LOG_A(LOG_ERROR, "Kernel: StartService failed. Error: %lu", GetLastError());
             ret = FALSE;
-
             goto cleanup;
         }
         else {
-            ret = FALSE;
-            LOG_A(LOG_INFO, "Kernel: Servicealready running.");
+            ret = TRUE;  // Service already running should be success
+            LOG_A(LOG_INFO, "Kernel: Service already running.");
         }
     }
     else {
         ret = TRUE;
-        LOG_A(LOG_INFO, "Kernel: Servicestarted successfully.");
+        LOG_A(LOG_INFO, "Kernel: Service started successfully.");
     }
 
 cleanup:
     if (hService) {
-        DeleteService(hService);
+        if (!ret) {
+            // Only delete service if we failed to start it
+            DeleteService(hService);
+        }
         CloseServiceHandle(hService);
     }
     if (hSCManager) {
@@ -171,11 +227,11 @@ BOOL UnloadKernelDriver() {
     }
 
     if (ControlService(hService, SERVICE_CONTROL_STOP, &status)) {
-        LOG_A(LOG_INFO, "Kernel: Servicestopped successfully.");
+        LOG_A(LOG_INFO, "Kernel: Service stopped successfully.");
         ret = TRUE;
     }
     else if (GetLastError() == ERROR_SERVICE_NOT_ACTIVE) {
-        LOG_A(LOG_INFO, "Kernel: Serviceis not running.");
+        LOG_A(LOG_INFO, "Kernel: Service is not running.");
         ret = TRUE;
     }
     else {
@@ -190,7 +246,7 @@ BOOL UnloadKernelDriver() {
         goto cleanup;
     }
     else {
-        LOG_A(LOG_INFO, "Kernel: Servicedeleted successfully.");
+        LOG_A(LOG_INFO, "Kernel: Service deleted successfully.");
     }
 
 cleanup:

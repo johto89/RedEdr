@@ -1,24 +1,12 @@
 #include <windows.h>
 #include <evntrace.h>
 #include <tdh.h>
-#include <combaseapi.h>
-#include <iostream>
-#include <tdh.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <evntrace.h>
-
-#include <sddl.h>
-
-#include "emitter.h"
-#include "objcache.h"
-#include "logging.h"
-#include "etwtireader.h"
-#include "etwtihandler.h"
-#include "piping.h"
-
 #include <krabs.hpp>
 
+
+#include "etwtireader.h"
+#include "etwtihandler.h"
+#include "logging.h"
 
 krabs::user_trace trace_ppl(L"RedEdrPpl");
 
@@ -61,8 +49,17 @@ void StartEtwtiReader() {
 
     LOG_A(LOG_INFO, "Preparing to read from ETW-TI");
     krabs::provider<> ti_provider(L"Microsoft-Windows-Threat-Intelligence");
+
+    // Test: Will this produce all events?
+    if (0) {
+        ULONG64 all_keywords = 0xFFFFFFFFFFFFFFFF;
+        ti_provider.any(all_keywords);
+        ti_provider.all(all_keywords);
+        ti_provider.level(TRACE_LEVEL_VERBOSE);
+    }
     ti_provider.trace_flags(ti_provider.trace_flags() | EVENT_ENABLE_PROPERTY_STACK_TRACE);
     ti_provider.add_on_event_callback(event_callback);
+    ti_provider.add_on_event_callback(event_callback_defendertrace);
     trace_ppl.enable(ti_provider);
 
     LOG_A(LOG_INFO, "Start reading from ETW-TI");

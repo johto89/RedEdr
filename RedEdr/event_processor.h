@@ -3,19 +3,17 @@
 #include <windows.h>
 #include <vector>
 #include <string>
-#include <iostream>
-#include <sstream>
 #include <mutex>
 
 #include "json.hpp"
-#include "process.h"
+#include "myprocess.h"
 
 
 class EventProcessor {
 public:
 	EventProcessor();
 	void init();
-	void InitialProcessInfo(Process* process);
+	void LogInitialProcessInfo(Process* process);
 	void AnalyzeNewEvents(std::vector<std::string> events);
 	void SaveToFile();
 	std::string GetAllAsJson();

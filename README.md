@@ -1,35 +1,27 @@
 ﻿# RedEdr
 
-Display events from Windows to see the detection surface of your malware.
+Display events from Windows to see the detection surface of your malware. Same data as an ETW-based EDR sees (Defender, Elastic, Fibratus...). 
 
-Same data as an EDR sees. 
-
-* Find the telemetry your malware generates
+* Identify the telemetry your malware generates (detection surface)
 * Verify your anti-EDR techniques work
-* Debug and analyze malware
-
-RedEdr will observe one process, and identify malicious patterns. 
-A normal EDR will observe all processes, and identify malicious processes. 
+* Debug and analyze your malware
 
 It generates [JSON files](https://github.com/dobin/RedEdr/tree/master/Data)
 collecting [the telemetry](https://github.com/dobin/RedEdr/blob/master/Doc/captured_events.md) 
 of your RedTeaming tools. 
 
-Try it online at [rededr.r00ted.ch](https://rededr.r00ted.ch)
+It is now part of Detonator, see [detonator.r00ted.ch](https://detonator.r00ted.ch). 
 
 
 ## Screenshots
 
-The following shellcode execution:
+Shellcode execution:
 ```c
 	PVOID shellcodeAddr = VirtualAlloc(NULL, payloadSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 	memcpy(shellcodeAddr, payload, payloadSize);
 	VirtualProtect(shellcodeAddr, payloadSize, PAGE_EXECUTE_READWRITE, &dwOldProtection));
 	HANDLE hThread = CreateThread(NULL, 0, shellcodeAddr, shellcodeAddr, 0, &threadId);
 ```
-
-Can be detected in the RedEdr events by looking at
-the RW->RWX VirtualProtect and following CreateThread invocation.
 
 With ntdll.dll hooking:
 ![RedEdr Screenshot ntdll.dll hooking](https://raw.github.com/dobin/RedEdr/master/Doc/screenshot-web-rwx-dll.png)
@@ -45,15 +37,13 @@ ETW events:
   * Microsoft-Windows-Kernel-Process
   * Microsoft-Windows-Kernel-Audit-API-Calls
   * Microsoft-Windows-Security-Auditing
-    * needs SYSTEM
-    * restrictions apply, configure group policy
-  * And defender
+  * Defender
     * Microsoft-Antimalware-Engine
     * Microsoft-Antimalware-RTP
     * Microsoft-Antimalware-AMFilter
     * Microsoft-Antimalware-Scan-Interface
     * Microsoft-Antimalware-Protection
-* ETW-TI (Threat Intelligence) with a PPL service via ELAM driver
+  * ETW-TI (Threat Intelligence) with a PPL service via ELAM driver
 
 * Kernel Callbacks
   * PsSetCreateProcessNotifyRoutine
@@ -61,34 +51,24 @@ ETW events:
   * PsSetLoadImageNotifyRoutine
   * (ObRegisterCallbacks, not used atm)
 
-* AMSI-style ntdll.dll hooking 
-  * from kernelspace (KAPC from LoadImage callback)
-  * from userspace (ETW based, unreliable)
+* ntdll.dll hooking 
 
 * Callstacks
   * On ntdll.dll hook invocation
   * On several ETW events
  
-* process query:
+* process query
   * PEB
   * Loaded DLL's (and their regions)
 
 
 ## Installation
 
-Use a dedicated VM for RedEdr. Tested on unlicensed (no Defender) Win10 Pro. 
-Install VS2022 as we need it's debug libraries.
-
-Change Windows boot options to enable self-signed kernel drivers and reboot.
-As admin cmd:
-```
-bcdedit /set testsigning on
-bcdedit -debug on
-```
-
-If you use Hyper-V, uncheck "Security -> Enable Secure Boot". 
+Use a dedicated VM for RedEdr. 
 
 Extract release.zip into `C:\RedEdr`. **No other directories are supported.**
+
+Whitelist `C:\RedEdr\RedEdr.exe` in your AV (Defender).
 
 Start terminal as local admin.
 
@@ -108,38 +88,53 @@ Usage:
 ...
 ```
 
-Try: `.\RedEdr.exe --all --trace otepad`, and then start notepad 
+Try: `.\RedEdr.exe --etw --trace otepad`, and then start notepad 
 (will be `notepad.exe` on Windows 10, `Notepad.exe` on Windows 11).
 The log should be printed as stdout.
 
 
-## Standard Usage
+## Simple ETW Usage
 
 RedEdr will trace all processes containing by process image name (exe path).
 
-Enable all consumers, and provide as web on [http://localhost:8080](http://localhost:8080), 
-and disable output logging for performance:
+Capture ETW events and provide a web interface on [http://localhost:8081](http://localhost:8081):
 ```
-PS > .\RedEdr.exe --all --web --hide --trace notepad.exe
-```
-
-Be aware ETW-TI (and possibly other ETW) will record the DLL hooking events if used together
-like this. Better use one of the following.
-
-
-### ntdll.dll hooking
-
-KAPC DLL injection for ntdll.dll hooking. Thats what many EDR's depend on:
-```
-PS > .\RedEdr.exe --kernel --inject --trace notepad.exe
+PS > .\RedEdr.exe --etw --web --trace notepad.exe
 ```
 
-This requires self-signed kernel modules to load. 
+
+## Advanced Usage
+
+For ntdll.dll hooking and ETW-TI, we need to configure windows so it can
+load our kernel module. 
+
+Change Windows boot options to enable self-signed kernel drivers and reboot.
+
+In admin cmd:
+```
+PS > bcdedit /set testsigning on
+
+# required for win11 on proxmox even with secureboot disabled in bios
+PS > bcdedit /set {bootmgr} testsigning on
+PS > bcdedit /set {current} testsigning on
+PS > bcdedit /set hypervisorlaunchtype off
+
+PS > bcdedit -debug on
+PS > shutdown /r /t 0
+```
+
+If you use Hyper-V, uncheck "Security -> Enable Secure Boot". 
+
+If you use Proxmox, this works for me: 
+* Reboot VM, press ESC a lot to go to BIOS menu
+* Navigate to Device Manager > Secure Boot Configuration.
+* Uncheck Attempt Secure Boot.
+* Look for an option labeled Secure Boot Mode. Change it from Standard to Custom.
+* Enter the Custom Secure Boot Options (or "Key Management").
+* Select Delete all Secure Boot Variables (or "Clear Secure Boot Keys").
 
 
-### ETW & ETW-TI
-
-ETW is mostly useful for MDE and Elastic.
+### ETW-TI
 
 ETW-TI requires an ELAM driver to start `RedEdrPplService`, 
 and therefore requires self signed kernel driver option.
@@ -151,15 +146,61 @@ PS > .\RedEdr.exe --etw --etwti --trace notepad.exe
 ```
 
 If you want ETW Microsoft-Windows-Security-Auditing, start as SYSTEM (`psexec -i -s cmd.exe`). 
+
 See `gpedit.msc -> Computer Configuration -> Windows Settings -> Security Settings -> Advanced Audit Policy Configuration -> System Audit Policies - Local Group Policy object`
 for settings to log.
 
 
-## Detections
+### ntdll.dll hooking
 
-* RWX allocation
-* RW->RX protection change
-* Callstack from non-image
+KAPC DLL injection for ntdll.dll hooking. Thats what many older EDR's depend on. 
+Also requires our own kernel module. 
+
+```
+PS > .\RedEdr.exe --hook --trace notepad.exe
+```
+
+
+
+## EDR Introspection (for Defender)
+
+The following is useful to reverse engineer EDR's, and to verify your anti-EDR techniques
+are targeted. It will observe Defender EDR. 
+
+For more details, see Levi's blog at [My Hacker Blog](https://blog.levi.wiki/), 
+and the [EDR-Introspection](https://github.com/cailllev/EDR-Introspection) project. 
+
+
+### Microsoft-Antimalware-Engine ETW events
+
+Argument: `--with-antimalwareengine`
+
+Example: `.\RedEdr.exe --etw --trace putty --web --with-antimalwareengine`
+
+This will collect `Microsoft-Antimalware-Engine` events related to the target process. 
+See blog post [Defender Telemetry](https://blog.deeb.ch/posts/defender-telemetry/) for an overview of available events. 
+
+For example the "Behavior Monitoring BmProcessContextStart", which indicates Defender will start behavior monitoring on the targeted process:
+```
+Behavior Monitoring BmProcessContextStart etw etw_event_id:0x6D etw_pid:0x1524 etw_process:MsMpEng.exe etw_provider_name:Microsoft-Antimalware-Engine etw_tid:0x37A8 etw_time:0x1DCC98C2B514B90 id:0x3 trace_id:0x29
+imagepath:\Device\HarddiskVolume6\toolz\putty.exe pid:0x11F48 processcontextid:0x188F7789520
+```
+
+
+### MsMpEng.exe ETW events
+
+Argument: `--with-defendertrace`
+
+Example: `.\RedEdr.exe --etw --etwti --trace putty --web --with-defendertrace`
+
+This will collect `msmpeng.exe` ETW events related to our target process. 
+See blog post [Windows Telemetry](https://blog.deeb.ch/posts/windows-telemetry/) for an overview of available events. 
+
+For example "Info" ETW event of "Microsoft-Windows-Kernel-Audit-API-Calls" accessing our target process:
+```
+Info etw etw_event_id:0x6 etw_pid:0x1524 etw_process:MsMpEng.exe etw_provider_name:Microsoft-Windows-Kernel-Audit-API-Calls etw_tid:0x21E0 etw_time:0x1DCC9BA7177FD80 id:0x1 trace_id:0x29
+desiredaccess:0x1FFFFF returncode:0x0 targetprocessid:0x1524 targetthreatid:0x21E0
+```
 
 
 ## Example Output
@@ -258,10 +299,27 @@ Good luck.
 
 Use VS2022. Compile as DEBUG.
 
-To compile the kernel driver: 
-* Install WDK (+SDK): https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk
+To compile the kernel driver:
+* check https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk 
+* Read the instructions on the website carefully
+* Install the shit in visual studio 2022 installer which is needed
+* Install the SDK, and WDK
+* Make sure you have the correct version installed for your system (eg. 10.0.26100 vs 10.0.28000)
+* If it doesnt work, abondon all hope and install Linux
 
-It should deploy everything into `C:\RedEdr\`.
+On building, it should deploy everything into `C:\RedEdr\`.
+
+On command line, use Visual Studio developer console. 
+
+Everything:
+```
+repos\RedEdr>msbuild RedEdr.sln /p:Configuration=Debug /p:Platform=x64
+```
+
+RedEdr only:
+```
+repos\RedEdr>msbuild RedEdr.sln /p:Configuration=Debug /p:Platform=x64 /t:RedEdr
+```
 
 
 ## Based on

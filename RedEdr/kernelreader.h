@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vector>
 
-void KernelReaderInit(std::vector<HANDLE>& threads);
+bool KernelReaderInit(std::vector<HANDLE>& threads);
 void KernelReaderShutdown();

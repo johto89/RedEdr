@@ -1,10 +1,7 @@
 #include <iostream>
-#include <filesystem>
 #include <vector>
-#include <tchar.h>
+#include <atomic>
 #include <windows.h>
-#include <wtsapi32.h>
-#include <UserEnv.h>
 
 #include "httplib.h" // Needs to be on top?
 
@@ -16,9 +13,8 @@
 #include "webserver.h"
 #include "process_resolver.h"
 #include "manager.h"
-#include "event_detector.h"
 #include "event_processor.h"
-#include "executor.h"
+#include "etwreader.h"
 
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "userenv.lib")
@@ -34,7 +30,11 @@ using json = nlohmann::json;
 
 
 HANDLE webserver_thread;
+HANDLE hStopEventWeb = NULL;  // signaled to request thread stop
 httplib::Server svr;
+int webserver_port;
+
+std::atomic<bool> in_use{false};
 
 
 std::wstring StripToFirstDot(const std::wstring& input) {
@@ -72,99 +72,105 @@ std::vector<std::wstring> GetFilesInDirectory(const std::wstring& directory) {
 
 
 std::string getRecordingsAsJson() {
-    std::stringstream output;
-    output << "[";
-    std::vector<std::wstring> names = GetFilesInDirectory(L"C:\\RedEdr\\Data\\*.events.json");
-    for (auto it = names.begin(); it != names.end(); ++it) {
-        output << "\"" << wstring2string(*it) << "\"";
-        if (std::next(it) != names.end()) {
-            output << ",";  // Add comma only if it's not the last element
+    try {
+        std::stringstream output;
+        output << "[";
+        std::vector<std::wstring> names = GetFilesInDirectory(L"C:\\RedEdr\\Data\\*.events.json");
+        for (auto it = names.begin(); it != names.end(); ++it) {
+            std::wstring name = *it;  // Create a proper lvalue for wstring2string
+            output << "\"" << wstring2string(name) << ".events.json" << "\"";
+            if (std::next(it) != names.end()) {
+                output << ",";  // Add comma only if it's not the last element
+            }
+        }
+        output << "]";
+        return output.str();
+    } catch (const std::exception& e) {
+        LOG_A(LOG_ERROR, "Error in getRecordingsAsJson: %s", e.what());
+        return "[]";  // Return empty array on error
+    }
+}
+
+
+std::vector<std::string> GetPplLogs() {
+    std::vector<std::string> logs;
+    std::ifstream file("C:\\RedEdr\\pplservice.log");
+    if (!file.is_open()) {
+        return logs;
+    }
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty()) {
+            logs.push_back(line);
         }
     }
-    output << "]";
-    return output.str();
+    file.close();
+    return logs;
 }
 
-
-bool StartWithExplorer(std::string programPath) {
-    std::string fullpath = "explorer.exe " + programPath;
-    wchar_t* commandLine = string2wcharAlloc(fullpath);
-
-    LOG_W(LOG_INFO, L"Executing malware: %s", commandLine);
-    
-    // Start the process
-    STARTUPINFO si = { sizeof(STARTUPINFO) };
-    PROCESS_INFORMATION pi = { 0 };
-    if (!CreateProcessW(NULL, commandLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        wprintf(L"Failed to start %s with explorer.exe. Error: %d\n", 
-            commandLine, GetLastError());
-        return false;
+bool HasAllowedExtension(const std::string& filename, const std::vector<std::string>& extensions) {
+    for (const auto& ext : extensions) {
+        if (filename.length() >= ext.length() &&
+            filename.compare(filename.length() - ext.length(), ext.length(), ext) == 0) {
+            return true;
+        }
     }
-
-    // Clean up
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return true;
+    return false;
 }
-
-
-BOOL ExecMalware(std::string filename, std::string filedata) {
-    std::string filepath = "C:\\RedEdr\\data\\" + filename;
-    std::ofstream ofs(filepath, std::ios::binary);
-    if (ofs) {
-        ofs.write(filedata.data(), filedata.size());
-        ofs.close();
-    }
-    else {
-        LOG_A(LOG_ERROR, "Could not write file");
-        return FALSE;
-    }
-	return(g_Executor.Start(string2wcharAlloc(filepath.c_str())));
-}
-
 
 DWORD WINAPI WebserverThread(LPVOID param) {
-    LOG_A(LOG_INFO, "!WEB: Start Webserver thread");
-    
+    // The UI
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
-        std::string indexhtml = read_file("C:\\RedEdr\\index.html");
-        res.set_content(indexhtml, "text/html");
-    });
-    svr.Get("/recordings", [](const httplib::Request&, httplib::Response& res) {
-        std::string indexhtml = read_file("C:\\RedEdr\\recording.html");
-        res.set_content(indexhtml, "text/html");
+        try {
+            std::string indexhtml = read_file("C:\\RedEdr\\index.html");
+            if (indexhtml.empty()) {
+                res.status = 404;
+                res.set_content("File not found", "text/plain");
+                return;
+            }
+            res.set_content(indexhtml, "text/html");
+        } catch (const std::exception& e) {
+            LOG_A(LOG_ERROR, "Error serving index.html: %s", e.what());
+            res.status = 500;
+            res.set_content("Internal server error", "text/plain");
+        }
     });
     svr.Get("/static/design.css", [](const httplib::Request&, httplib::Response& res) {
-        std::string indexhtml = read_file("C:\\RedEdr\\design.css");
-        res.set_content(indexhtml, "text/css");
+        try {
+            std::string indexhtml = read_file("C:\\RedEdr\\design.css");
+            if (indexhtml.empty()) {
+                res.status = 404;
+                res.set_content("File not found", "text/plain");
+                return;
+            }
+            res.set_content(indexhtml, "text/css");
+        } catch (const std::exception& e) {
+            LOG_A(LOG_ERROR, "Error serving design.css: %s", e.what());
+            res.status = 500;
+            res.set_content("Internal server error", "text/plain");
+        }
     });
     svr.Get("/static/shared.js", [](const httplib::Request&, httplib::Response& res) {
-        std::string indexhtml = read_file("C:\\RedEdr\\shared.js");
-        res.set_content(indexhtml, "text/javascript");
+        try {
+            std::string indexhtml = read_file("C:\\RedEdr\\shared.js");
+            if (indexhtml.empty()) {
+                res.status = 404;
+                res.set_content("File not found", "text/plain");
+                return;
+            }
+            res.set_content(indexhtml, "text/javascript");
+        } catch (const std::exception& e) {
+            LOG_A(LOG_ERROR, "Error serving shared.js: %s", e.what());
+            res.status = 500;
+            res.set_content("Internal server error", "text/plain");
+        }
     });
-
-    svr.Get("/api/events", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(g_EventProcessor.GetAllAsJson(), "application/json; charset=UTF-8");
+    svr.Get("/api/save", [](const httplib::Request&, httplib::Response& res) {
+        g_EventProcessor.SaveToFile();
     });
-
-    svr.Get("/api/detections", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(g_EventDetector.GetAllDetectionsAsJson(), "application/json; charset=UTF-8");
-    });
-
-    svr.Get("/api/recordings", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(getRecordingsAsJson(), "application/json; charset=UTF-8");
-    });
-    svr.Get("/api/recordings/:id", [](const httplib::Request& req, httplib::Response& res) {
-        auto user_id = req.path_params.at("id");
-        std::string path = "C:\\RedEdr\\Data\\" + user_id + ".events.json";
-        std::string data = read_file(path);
-        res.set_content(data.c_str(), "application/json");
-    });
-
     svr.Get("/api/stats", [](const httplib::Request&, httplib::Response& res) {
         nlohmann::json stats = {
             {"events_count", g_EventAggregator.GetCount()},
-            {"detections_count", g_EventDetector.GetDetectionsCount()},
             {"num_kernel", g_EventProcessor.num_kernel},
             {"num_etw", g_EventProcessor.num_etw},
             {"num_etwti", g_EventProcessor.num_etwti},
@@ -173,107 +179,200 @@ DWORD WINAPI WebserverThread(LPVOID param) {
         };
         res.set_content(stats.dump(), "application/json; charset=UTF-8");
     });
-    svr.Get("/api/meminfo", [](const httplib::Request&, httplib::Response& res) {
-        nlohmann::json info = g_EventDetector.GetTargetMemoryChanges()->ToJson();
-        res.set_content(info.dump(), "application/json; charset=UTF-8");
-    });
 
-    svr.Get("/api/trace", [](const httplib::Request& req, httplib::Response& res) {
-        json response = { {"trace", g_Config.targetExeName }};
+    // Provide Logs
+    svr.Get("/api/logs/rededr", [](const httplib::Request&, httplib::Response& res) {
+        // Arry of Dicts
+        // Like:
+        /*
+            [
+                { "date":"2025-07-20-10-36-24",
+                  "do_etw":false,
+                  "do_etwti":false,
+                  "do_hook":false,
+                  "do_hook_callstack": true,
+                  "func":"init",
+                  "target":"otepad",
+                  "trace_id":41,
+                  "type":"meta",
+                  "version":"0.4"
+                }, 
+                ...
+            ]
+        */
+        try {
+            res.set_content(g_EventProcessor.GetAllAsJson(), "application/json");
+        } catch (const std::exception& e) {
+            LOG_A(LOG_ERROR, "Error getting events: %s", e.what());
+            res.status = 500;
+            json error_response = {
+                { "status", "error" },
+                { "message", "Internal server error" }
+            };
+            res.set_content(error_response.dump(), "application/json");
+        }
+    });
+    svr.Get("/api/logs/agent", [](const httplib::Request& req, httplib::Response& res) {
+        // Array of Strings
+        // Like. 
+        /* 
+           [ 
+            "RedEdr 0.4",
+            "Config: tracing otepad",
+            "Permissions: Enabled PRIVILEGED & DEBUG",
+            ]
+        */
+        std::vector agentLogs = GetAgentLogs(); // List of srings
+        std::vector pplLogs = GetPplLogs();
+
+		// return both logs in a single array
+		json response = json::array();
+		for (const auto& log : agentLogs) {
+			response.push_back(log);
+		}
+		for (const auto& log : pplLogs) {
+			response.push_back(log);
+		}
         res.set_content(response.dump(), "application/json");
     });
-    svr.Post("/api/trace", [](const httplib::Request& req, httplib::Response& res) {
+
+    // Functions
+    svr.Get("/api/trace/info", [](const httplib::Request& req, httplib::Response& res) {
+        json response = { {"trace", g_Config.targetProcessNames } };
+        res.set_content(response.dump(), "application/json");
+    });
+    svr.Post("/api/trace/start", [](const httplib::Request& req, httplib::Response& res) {
         try {
             auto data = json::parse(req.body);
             if (data.contains("trace")) {
-                std::string traceName = data["trace"].get<std::string>();
-				LOG_A(LOG_INFO, "Trace target: %s", traceName.c_str());
-				g_Config.targetExeName = traceName;
+                if (! data["trace"].is_array()) {
+                    LOG_A(LOG_ERROR, "Trace start: Targets should be an array, but is %s", data["trace"]);
+                    json error_response = { {"error", "trace should be an array"} };
+                    res.status = 400;
+                    res.set_content(error_response.dump(), "application/json");
+                }
+                std::vector<std::string> traceNames = data["trace"].get<std::vector<std::string>>();
+                if (!ManagerApplyNewTargets(traceNames)) {
+                    LOG_A(LOG_ERROR, "Trace start: Failed to apply new targets");
+                    json error_response = { {"error", "Failed to apply new targets"} };
+                    res.status = 500;
+                    res.set_content(error_response.dump(), "application/json");
+					return;
+                }
+                trace_in_progress(true);
                 json response = { {"result", "ok"} };
                 res.set_content(response.dump(), "application/json");
             }
             else {
-                json error = { {"error", "No 'trace' key provided"} };
+                json error_response = { {"error", "No 'trace' key provided"} };
                 res.status = 400;
-                res.set_content(error.dump(), "application/json");
+                res.set_content(error_response.dump(), "application/json");
             }
         }
         catch (const json::parse_error& e) {
-            json error = { {"error", "Invalid JSON data: " + std::string(e.what())}};
+            json error_response = { {"error", "Invalid JSON data: " + std::string(e.what())} };
             res.status = 400;
-            res.set_content(error.dump(), "application/json");
+            res.set_content(error_response.dump(), "application/json");
         }
     });
-    svr.Get("/api/save", [](const httplib::Request&, httplib::Response& res) {
-        g_EventProcessor.SaveToFile();
+    svr.Post("/api/trace/reset", [](const httplib::Request&, httplib::Response& res) {
+        trace_in_progress(false);
+        g_EventAggregator.ResetData();
+        g_EventProcessor.ResetData();
     });
-    svr.Get("/api/reset", [](const httplib::Request&, httplib::Response& res) {
-        ResetEverything();
+    svr.Post("/api/trace/stop", [](const httplib::Request&, httplib::Response& res) {
+        trace_in_progress(false);
     });
-    svr.Get("/api/start", [](const httplib::Request& req, httplib::Response& res) {
-        g_Config.enabled = TRUE;
-        ManagerReload();
-        json response = { {"status", "ok"}};
-        res.set_content(response.dump(), "application/json");
+
+    // Lock management endpoints
+    svr.Post("/api/lock/acquire", [](const httplib::Request&, httplib::Response& res) {
+        bool expected = false;
+        if (!in_use.compare_exchange_strong(expected, true)) {
+            res.status = 409; // Conflict
+            json error_response = {
+                { "status", "error" },
+                { "message", "Resource is already in use" },
+            };
+            res.set_content(error_response.dump(), "application/json");
+        }
+        // else: successfully acquired, returns 200 OK
     });
-    svr.Get("/api/stop", [](const httplib::Request& req, httplib::Response& res) {
-        g_Config.enabled = FALSE;
-        ManagerReload();
-        json response = { {"status", "ok"} };
-        res.set_content(response.dump(), "application/json");
+    svr.Post("/api/lock/release", [](const httplib::Request&, httplib::Response& res) {
+        if (! in_use) {
+            // We dont really care
+            LOG_A(LOG_INFO, "Release lock even tho it was not aquired");
+        }
+        in_use = false;
+        // Returns 200 OK
     });
-    svr.Get("/api/log", [](const httplib::Request& req, httplib::Response& res) {
+    svr.Get("/api/lock/status", [](const httplib::Request&, httplib::Response& res) {
         json response = {
-            { "log", GetLogs() },
-            { "output", g_Executor.GetOutput() }
-		};
+            { "in_use", in_use.load() } // .load() because JSON doesnt understand bool
+        };
         res.set_content(response.dump(), "application/json");
     });
-    if (g_Config.enable_remote_exec) {
-        svr.Post("/api/exec", [](const httplib::Request& req, httplib::Response& res) {
-            // curl.exe -X POST http://localhost:8080/api/exec -F "file=@C:\temp\RedEdrTester.exe"
-            auto file = req.get_file_value("file");
-            auto filename = file.filename;
-            if (file.content.empty() || filename.empty()) {
-                LOG_A(LOG_WARNING, "Webserver: Data error: %d %d", file.content.size(), filename.size());
-                res.status = 400;
-                res.set_content("Invalid request: filename or file data is missing.", "text/plain");
-                return;
-            }
-            BOOL ret = ExecMalware(filename, file.content);
-			if (!ret) {
-				res.status = 500;
-				res.set_content("Failed to execute malware", "text/plain");
-				return;
-			}
-            std::string output = g_Executor.GetOutput();
-            json response = { {"status", "ok"}, {"output", output} };
-            res.set_content(response.dump(), "application/json");
-        });
+
+
+    LOG_A(LOG_INFO, "WEB: Web Server listening on http://0.0.0.0:%i", webserver_port);
+    
+    bool listen_result = false;
+    try {
+        listen_result = svr.listen("0.0.0.0", webserver_port);
+    } catch (const std::exception& e) {
+        LOG_A(LOG_ERROR, "WEB: Server listen failed: %s", e.what());
+    } catch (...) {
+        LOG_A(LOG_ERROR, "WEB: Server listen failed with unknown exception");
     }
-
-    LOG_A(LOG_INFO, "WEB: Web Server listening on http://0.0.0.0:8080");
-    svr.listen("0.0.0.0", 8080);
-    LOG_A(LOG_INFO, "!WEB: Exit Webserver thread");
-
+    
+    if (!listen_result) {
+        LOG_A(LOG_INFO, "WEB: Server listen returned false (normal during shutdown)");
+    }
+    
+    LOG_A(LOG_DEBUG, "!WEB: Thread finished");
     return 0;
 }
 
 
-int InitializeWebServer(std::vector<HANDLE>& threads) {
+int InitializeWebServer(std::vector<HANDLE>& threads, int port) {
+    webserver_port = port;
+    hStopEventWeb = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (hStopEventWeb == NULL) {
+        LOG_A(LOG_ERROR, "WEB: Failed to create stop event");
+        return 1;
+    }
     webserver_thread = CreateThread(NULL, 0, WebserverThread, NULL, 0, NULL);
     if (webserver_thread == NULL) {
         LOG_A(LOG_ERROR, "WEB: Failed to create thread for webserver");
+        CloseHandle(hStopEventWeb);
+        hStopEventWeb = NULL;
         return 1;
     }
+    LOG_A(LOG_DEBUG, "!Web: Thread started");
     threads.push_back(webserver_thread);
     return 0;
 }
 
 
 void StopWebServer() {
+    // Signal stop
+    if (hStopEventWeb != NULL) {
+        SetEvent(hStopEventWeb);
+    }
+
+    svr.stop();
+
+    // Wait for thread to exit cleanly
     if (webserver_thread != NULL) {
-        svr.stop();
+        if (WaitForSingleObject(webserver_thread, 5000) == WAIT_TIMEOUT) {
+            LOG_A(LOG_WARNING, "WEB: Thread did not exit in time, force-terminating");
+            TerminateThread(webserver_thread, 1);
+        }
+        // handle ownership stays with the threads vector; do not close here
+    }
+
+    if (hStopEventWeb != NULL) {
+        CloseHandle(hStopEventWeb);
+        hStopEventWeb = NULL;
     }
 }
 

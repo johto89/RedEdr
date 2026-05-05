@@ -1,10 +1,13 @@
 #pragma once
 
-#include <windows.h>
 #include <evntrace.h>
-#include <tdh.h>
+#include <vector>
+#include <string>
 
 #include <krabs.hpp>
 
-void enable_consumer(BOOL e);
 void event_callback(const EVENT_RECORD& record, const krabs::trace_context& trace_context);
+void event_callback_defendertrace(const EVENT_RECORD& record, const krabs::trace_context& trace_context);
+
+extern volatile BOOL g_DoDefenderTrace;
+void SetDefenderTraceConfig(BOOL enabled, const std::vector<std::string>& targetNames);

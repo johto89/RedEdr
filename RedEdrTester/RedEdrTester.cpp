@@ -22,24 +22,24 @@
 
 // Stuff we test
 #include "../RedEdr/config.h"
-#include "../RedEdr/process_resolver.h"
+#include "../RedEdrShared/process_resolver.h"
 #include "../RedEdr/event_processor.h"
-#include "../RedEdr/event_detector.h"
-#include "../RedEdr/mem_static.h"
+#include "../RedEdrShared/process_mem_static.h"
 #include "../RedEdr/dllinjector.h"
 #include "../RedEdr/webserver.h"
 #include "../RedEdr/kernelinterface.h"
 #include "../RedEdr/serviceutils.h"
-
+#include "../RedEdrShared/piping.h"
+#include "../RedEdr/logging.h"
 
 void SendToKernel(int enable, char* target) {
 	printf("Sending: %d %s", enable, target);
-	EnableKernelDriver(enable, target);
+	ConfigureKernelDriver(enable);
 }
 
 
 void SendToKernelReader(char* data) {
-	PipeClient pipeClient;
+	PipeClient pipeClient("KernelReaderTest");
 	pipeClient.Connect(KERNEL_PIPE_NAME);
 	pipeClient.Send(data);
 	pipeClient.Disconnect();
@@ -47,25 +47,22 @@ void SendToKernelReader(char* data) {
 
 
 void SendToDllReader(char* data) {
-	PipeClient pipeClient;
+	PipeClient pipeClient("DllReaderTest");
 	pipeClient.Connect(DLL_PIPE_NAME);
 	pipeClient.Send(data);
 	pipeClient.Disconnect();
 }
 
 
-void processinfo(wchar_t* pidStr) {
-	PermissionMakeMeDebug();
+void processinfo(char* pidStr) {
+	//PermissionMakeMeDebug();
 	InitProcessQuery();
 
-	wchar_t* end;
-	long pid = wcstoul(pidStr, &end, 10);
+	long pid = strtol(pidStr, nullptr, 10);
 
 	g_Config.debug = 1;
 	g_Config.hide_full_output = 0;
-	g_Config.targetExeName = "otepad";
-
-	//Process* process = new Process(pid);
+	g_ProcessResolver.SetTargetNames({ "otepad", });
 	Process* process = g_ProcessResolver.getObject(pid);  // use the real resolver
 	
 	// PEB
@@ -139,10 +136,10 @@ void DoStuff() {
 }
 
 
-void AnalyzeFile(wchar_t *fname) {
+void AnalyzeFile(char *fname) {
 	g_Config.hide_full_output = 1;
 	g_Config.debug = 1;
-	std::string filename = wchar2string(fname);
+	std::string filename = std::string(fname);
 	LOG_A(LOG_INFO, "Analyzer: Reading %s", filename.c_str());
 	std::string json_file_content = read_file(filename);
 	if (json_file_content.empty()) {
@@ -162,14 +159,6 @@ void AnalyzeFile(wchar_t *fname) {
 		std::cerr << "JSON data is not an array." << std::endl;
 		return;
 	}
-	for (auto& event : json_data) {
-		g_EventDetector.ScanEventForDetections(event);
-	}
-	std::cout << g_EventDetector.GetAllDetectionsAsJson() << std::endl;
-
-	// Parse the JSON string into a nlohmann::json object
-	std::string j = g_EventDetector.GetTargetMemoryChanges()->ToJson().dump(4);
-	std::cout << j << std::endl;
 }
 
 
@@ -181,42 +170,41 @@ void test() {
 
 }
 
-int wmain(int argc, wchar_t* argv[]) {
+int main(int argc, char* argv[]) {
 	if (argc < 1) {
 		LOG_W(LOG_ERROR, L"Usage: %s <what>", argv[0]);
 		return 1;
 	}
 
-	if (wcscmp(argv[1], L"send2kernel") == 0) {
+	if (strcmp(argv[1], "send2kernel") == 0) {
 		// Example: 1 notepad.exe
-		wchar_t* end;
-		long enable = wcstol(argv[2], &end, 10);
+		long enable = strtol(argv[2], nullptr, 10);
 		SendToKernel(enable, argv[3]);
 	}
-	else if (wcscmp(argv[1], L"send2kernelreader") == 0) {
+	else if (strcmp(argv[1], "send2kernelreader") == 0) {
 		// Example: 
 		SendToKernelReader(argv[2]);
 	}
-	else if (wcscmp(argv[1], L"send2dllreader") == 0) {
+	else if (strcmp(argv[1], "send2dllreader") == 0) {
 		// Example: 
 		SendToDllReader(argv[2]);
 	}
-	else if (wcscmp(argv[1], L"processinfo") == 0) {
+	else if (strcmp(argv[1], "processinfo") == 0) {
 		processinfo(argv[2]);
 	}
-	else if (wcscmp(argv[1], L"analyzer") == 0) {
+	else if (strcmp(argv[1], "analyzer") == 0) {
 		if (argc == 3) {
 			AnalyzeFile(argv[2]);
 		}
 		else {
-			AnalyzeFile((wchar_t*) L"C:\\RedEdr\\Data\\notepad.events.txt");
+			AnalyzeFile((char *) "C:\\RedEdr\\Data\\notepad.events.txt");
 		}
 	}
-	else if (wcscmp(argv[1], L"dostuff") == 0) {
+	else if (strcmp(argv[1], "dostuff") == 0) {
 		Sleep(500); // give time to do dll injection
 		DoStuff();
 	}
-	else if (wcscmp(argv[1], L"test") == 0) {
+	else if (strcmp(argv[1], "test") == 0) {
 		test();
 	}
 	else {

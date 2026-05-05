@@ -1,7 +1,6 @@
 #pragma once
 
 #include <ntddk.h>
-#include <string.h>
 #include <stdio.h>
 
 
@@ -15,7 +14,7 @@ typedef struct _PROCESS_INFO {
     wchar_t parent_name[PROC_NAME_LEN];
 
     int observe;
-    int injected;
+    volatile LONG injected;
 } PROCESS_INFO, * PPROCESS_INFO;
 
 

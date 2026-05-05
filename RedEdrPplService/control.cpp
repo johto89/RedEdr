@@ -1,22 +1,22 @@
-#include <stdio.h>
 #include <Windows.h>
 
 #include "control.h"
 #include "emitter.h"
 #include "../Shared/common.h"
 #include "logging.h"
-#include "objcache.h"
 #include "etwtireader.h"
+#include "etwtihandler.h"
 #include "piping.h"
-#include "utils.h"
+#include "json.hpp"
+#include "process_resolver.h"
 
 DWORD start_child_process(wchar_t* childCMD);
 
 
 HANDLE control_thread = NULL;
-BOOL keep_running = TRUE;
+volatile BOOL keep_running = TRUE; // Made volatile for thread safety
 
-PipeServer pipeServer = PipeServer(std::string("EtwTi"), (wchar_t*)PPL_SERVICE_PIPE_NAME);
+PipeServer pipeServer = PipeServer("RedEdrPPL Server", (wchar_t*)PPL_SERVICE_PIPE_NAME);
 
 
 DWORD WINAPI ServiceControlPipeThread(LPVOID param) {
@@ -28,48 +28,74 @@ DWORD WINAPI ServiceControlPipeThread(LPVOID param) {
             LOG_A(LOG_ERROR, "Error waiting for RedEdr.exe");
             continue;
         }
+        LOG_A(LOG_INFO, "Control: Client connected");
+        LOG_A(LOG_INFO, "Control: Connect us back to RedEdr");
+        if (!ConnectEmitterPipe()) { // Connect to the RedEdr pipe
+            LOG_A(LOG_ERROR, "Control: Failed to connect to RedEdr pipe");
+            //break; // Exit the loop if connection fails
+        }
+
         while (keep_running) {
+            LOG_A(LOG_INFO, "Control: Wait for command");
             memset(buffer, 0, sizeof(buffer));
             if (!pipeServer.Receive(buffer, PPL_CONFIG_LEN)) {
-                //LOG_A(LOG_ERROR, "Error waiting for RedEdr.exe config");
+                LOG_A(LOG_ERROR, "Error waiting for RedEdr.exe command");
                 break;
             }
 
-            //if (wcscmp(buffer, L"start") == 0) {
-            if (strstr(buffer, "start:") != NULL) {
-                char* token = NULL, * context = NULL;
-                LOG_A(LOG_INFO, "Control: Received command: start");
+            LOG_A(LOG_INFO, "Control: Received command: %s", buffer);
+            
+            try {
+                // Try to parse as JSON first
+                nlohmann::json j = nlohmann::json::parse(buffer);
+                
+                if (j.contains("command")) {
+                    std::string command = j["command"];
+                    
+                    if (command == "start") {
+                        if (j.contains("targets") && j["targets"].is_array()) {
+                            LOG_A(LOG_INFO, "Control: Processing start command with %zu targets", j["targets"].size());
+                            std::vector<std::string> targets = j["targets"];
+                            g_ProcessResolver.SetTargetNames(targets);
+                            g_ProcessResolver.RefreshTargetMatching();
 
-                // should give "start:"
-                token = strtok_s(buffer, ":", &context);
-                if (token != NULL) {
-                    // should give the thing after "start:"
-                    token = strtok_s(NULL, ":", &context);
-                    if (token != NULL) {
-                        LOG_A(LOG_INFO, "Control: Target: %s", token);
-                        wchar_t* target_name = char2wcharAlloc(token);
-                        set_target_name(target_name);
-                        ConnectEmitterPipe(); // Connect to the RedEdr pipe
-                        enable_consumer(TRUE);
+                            BOOL doDefenderTrace = j.value("do_defendertrace", false) ? TRUE : FALSE;
+                            SetDefenderTraceConfig(doDefenderTrace, targets);
+
+                            nlohmann::json start_event;
+                            start_event["event"] = "ppl_start";
+                            start_event["type"] = "meta";
+                            SendEmitterPipe((char *) start_event.dump().c_str());
+                        } else {
+                            LOG_A(LOG_ERROR, "Control: Start command missing 'targets' array");
+                        }
                     }
+                    else if (command == "stop") {
+                        nlohmann::json stop_event;
+                        stop_event["event"] = "ppl_stop";
+                        stop_event["type"] = "meta";
+                        SendEmitterPipe((char*) stop_event.dump().c_str());
+                    } else if (command == "shutdown") {
+                        LOG_A(LOG_INFO, "Control: Received JSON command: shutdown");
+                        keep_running = FALSE; // Signal thread to stop
+                        g_ServiceStopping = TRUE; // Signal main service loop to stop
+                        ShutdownEtwtiReader(); // also makes main return
+                        break;
+                    }
+                    else {
+                        LOG_A(LOG_INFO, "Control: Unknown JSON command: %s", command.c_str());
+                    }
+                } else {
+                    LOG_A(LOG_ERROR, "Control: JSON missing 'command' field");
                 }
             }
-            else if (strstr(buffer, "stop") != 0) {
-                LOG_A(LOG_INFO, "Control: Received command: stop");
-                enable_consumer(FALSE);
-                DisconnectEmitterPipe(); // Disconnect the RedEdr pipe
-            }
-            else if (strstr(buffer, "shutdown") != 0) {
-                LOG_A(LOG_INFO, "Control: Received command: shutdown");
-                //rededr_remove_service();  // attempt to remove service
-                StopControl(); // stop this thread
-                ShutdownEtwtiReader(); // also makes main return
-                break;
-            }
-            else {
-                LOG_A(LOG_INFO, "Control: Unknown command: %s", buffer);
+            catch (const nlohmann::json::parse_error& e) {
+                // Fallback to legacy string-based parsing for backward compatibility
+                LOG_A(LOG_WARNING, "Control: JSON parse failed %s", e.what());
             }
         }
+
+		LOG_A(LOG_INFO, "Control: Client disconnected, shutting down pipe");
         pipeServer.Shutdown();
     }
     LOG_A(LOG_INFO, "Control: Finished");
@@ -79,9 +105,16 @@ DWORD WINAPI ServiceControlPipeThread(LPVOID param) {
 
 void StartControl() {
     LOG_W(LOG_INFO, L"Control: Start Thread");
+    
+    // Reset the running flag
+    keep_running = TRUE;
+    
     control_thread = CreateThread(NULL, 0, ServiceControlPipeThread, NULL, 0, NULL);
     if (control_thread == NULL) {
-        LOG_W(LOG_INFO, L"Control: Failed to create thread");
+        DWORD error = GetLastError();
+        LOG_W(LOG_ERROR, L"Control: Failed to create thread, error: %d", error);
+    } else {
+        LOG_W(LOG_INFO, L"Control: Thread created successfully");
     }
 }
 
@@ -89,11 +122,22 @@ void StartControl() {
 void StopControl() {
     LOG_W(LOG_INFO, L"Control: Stop Thread");
 
-    // Disable the loops
+    // Signal the thread to stop
     keep_running = FALSE;
 
-    // Send some stuff so the ReadFile() in the pipe reader thread returns
-    pipeServer.Send((char*) "");
+    // Send empty data to unblock any pending pipe operations
+    pipeServer.Send((char*)"");
+
+    // Wait for the thread to finish (with timeout)
+    if (control_thread != NULL) {
+        DWORD waitResult = WaitForSingleObject(control_thread, 5000); // 5 second timeout
+        if (waitResult == WAIT_TIMEOUT) {
+            LOG_W(LOG_ERROR, L"Control: Thread did not stop gracefully, terminating");
+            TerminateThread(control_thread, 1);
+        }
+        CloseHandle(control_thread);
+        control_thread = NULL;
+    }
 }
 
 
@@ -114,29 +158,46 @@ void rededr_remove_service() {
 DWORD start_child_process(wchar_t* childCMD)
 {
     DWORD retval = 0;
+    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList = NULL;
+    PROCESS_INFORMATION ProcessInformation = { 0 };
+    DWORD ProtectionLevel = PROTECTION_LEVEL_SAME;
+
+
+    if (childCMD == NULL) {
+        LOG_W(LOG_ERROR, L"start_child_process: Invalid command parameter");
+        return ERROR_INVALID_PARAMETER;
+    }
+    
     LOG_W(LOG_INFO, L"start_child_process: Starting");
 
     // Create Attribute List
     STARTUPINFOEXW StartupInfoEx = { 0 };
     SIZE_T AttributeListSize = 0;
     StartupInfoEx.StartupInfo.cb = sizeof(StartupInfoEx);
+    
     InitializeProcThreadAttributeList(NULL, 1, 0, &AttributeListSize);
     if (AttributeListSize == 0) {
         retval = GetLastError();
-        LOG_W(LOG_INFO, L"start_child_process: InitializeProcThreadAttributeList1 Error: %d\n", retval);
+        LOG_W(LOG_ERROR, L"start_child_process: InitializeProcThreadAttributeList1 Error: %d", retval);
         return retval;
     }
-    StartupInfoEx.lpAttributeList =
-        (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, AttributeListSize);
-    if (InitializeProcThreadAttributeList(StartupInfoEx.lpAttributeList, 1, 0, &AttributeListSize) == FALSE) {
+    
+    lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, AttributeListSize);
+    if (lpAttributeList == NULL) {
+        LOG_W(LOG_ERROR, L"start_child_process: HeapAlloc failed");
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+    
+    StartupInfoEx.lpAttributeList = lpAttributeList;
+    
+    if (InitializeProcThreadAttributeList(lpAttributeList, 1, 0, &AttributeListSize) == FALSE) {
         retval = GetLastError();
-        LOG_W(LOG_INFO, L"start_child_process: InitializeProcThreadAttributeList2 Error: %d\n", retval);
-        return retval;
+        LOG_W(LOG_ERROR, L"start_child_process: InitializeProcThreadAttributeList2 Error: %d", retval);
+        goto cleanup;
     }
 
     // Set ProtectionLevel to be the same, i.e. PPL
-    DWORD ProtectionLevel = PROTECTION_LEVEL_SAME;
-    if (UpdateProcThreadAttribute(StartupInfoEx.lpAttributeList,
+    if (UpdateProcThreadAttribute(lpAttributeList,
         0,
         PROC_THREAD_ATTRIBUTE_PROTECTION_LEVEL,
         &ProtectionLevel,
@@ -145,13 +206,12 @@ DWORD start_child_process(wchar_t* childCMD)
         NULL) == FALSE)
     {
         retval = GetLastError();
-        LOG_W(LOG_INFO, L"start_child_process: UpdateProcThreadAttribute Error: %d\n", retval);
-        return retval;
+        LOG_W(LOG_ERROR, L"start_child_process: UpdateProcThreadAttribute Error: %d", retval);
+        goto cleanup;
     }
 
     // Start Process (hopefully)
-    PROCESS_INFORMATION ProcessInformation = { 0 };
-    LOG_W(LOG_INFO, L"start_child_process: Creating Process: '%s'\n", childCMD);
+    LOG_W(LOG_INFO, L"start_child_process: Creating Process: '%s'", childCMD);
     if (CreateProcess(NULL,
         childCMD,
         NULL,
@@ -165,17 +225,27 @@ DWORD start_child_process(wchar_t* childCMD)
     {
         retval = GetLastError();
         if (retval == ERROR_INVALID_IMAGE_HASH) {
-            LOG_W(LOG_INFO, L"start_child_process: CreateProcess Error: Invalid Certificate\n");
+            LOG_W(LOG_ERROR, L"start_child_process: CreateProcess Error: Invalid Certificate");
         }
         else {
-            LOG_W(LOG_INFO, L"start_child_process: CreateProcess Error: %d\n", retval);
+            LOG_W(LOG_ERROR, L"start_child_process: CreateProcess Error: %d", retval);
         }
-        return retval;
+        goto cleanup;
     }
 
-    // Don't wait on process handle, we're setting our child free into the wild
-    // This is to prevent any possible deadlocks
+    // Close handles immediately as we don't need to wait for the process
+    CloseHandle(ProcessInformation.hProcess);
+    CloseHandle(ProcessInformation.hThread);
+    
+    LOG_W(LOG_INFO, L"start_child_process: Process created successfully");
 
-    LOG_W(LOG_INFO, L"start_child_process: finished");
+cleanup:
+    // Clean up attribute list
+    if (lpAttributeList != NULL) {
+        DeleteProcThreadAttributeList(lpAttributeList);
+        HeapFree(GetProcessHeap(), 0, lpAttributeList);
+    }
+    
+    LOG_W(LOG_INFO, L"start_child_process: finished with return code %d", retval);
     return retval;
 }

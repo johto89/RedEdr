@@ -30,22 +30,31 @@
     <ClCompile Include="control.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="objcache.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="etwtihandler.cpp">
       <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\RedEdrShared\logging.cpp">
-      <Filter>Source Files\existing</Filter>
     </ClCompile>
     <ClCompile Include="..\RedEdrShared\piping.cpp">
       <Filter>Source Files\existing</Filter>
     </ClCompile>
+    <ClCompile Include="..\RedEdrShared\etw_krabs.cpp">
+      <Filter>Source Files\existing</Filter>
+    </ClCompile>
+    <ClCompile Include="logging.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\RedEdrShared\utils.cpp">
       <Filter>Source Files\existing</Filter>
     </ClCompile>
-    <ClCompile Include="..\RedEdrShared\etw_krabs.cpp">
+    <ClCompile Include="..\RedEdrShared\myprocess.cpp">
+      <Filter>Source Files\existing</Filter>
+    </ClCompile>
+    <ClCompile Include="..\RedEdrShared\process_resolver.cpp">
+      <Filter>Source Files\existing</Filter>
+    </ClCompile>
+    <ClCompile Include="..\RedEdrShared\process_query.cpp">
+      <Filter>Source Files\existing</Filter>
+    </ClCompile>
+    <ClCompile Include="..\RedEdrShared\process_mem_static.cpp">
       <Filter>Source Files\existing</Filter>
     </ClCompile>
   </ItemGroup>
@@ -62,13 +71,10 @@
     <ClInclude Include="uthash.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="objcache.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\RedEdrShared\logging.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="etwtihandler.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="logging.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
