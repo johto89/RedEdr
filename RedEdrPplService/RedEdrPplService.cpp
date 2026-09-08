@@ -29,8 +29,6 @@ void ShutdownService() {
     ShutdownEtwtiReader();
 	g_ProcessResolver.ResetData(); // Clear process cache
 
-    CleanupFileLogging(); // Clean up log file handle
-
     // Stopped
     g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
@@ -94,6 +92,23 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
     // Initialize object cache
 	g_ProcessResolver.PopulateAllProcesses();
 
+    // Get Defender information (for EDRi)
+    // Augment the MsMpEng.exe process info, even if it aint a target, so we can log its modules
+    DWORD pid = FindProcessIdByName(L"MsMpEng.exe");
+    if (pid != 0) {
+        Process* process = g_ProcessResolver.getObject(pid);
+        if (process) {
+            // Augment process info if not already done
+            if (!process->augmented) {
+                if (process->AugmentInfo()) {
+                    process->augmented = TRUE;
+                } else {
+                    LOG_A(LOG_ERROR, "Control: Failed to augment MsMpEng.exe process info");
+                }
+            }
+        }
+    }
+
     // Start Control thread which will listen on a pipe for commands
     StartControl();
 
@@ -153,6 +168,13 @@ DWORD ServiceEntry()
 
 int main(INT argc, CHAR** argv)
 {
+    // Register the ETW log provider first, so all subsequent LOG_A / LOG_W
+    // calls are captured. If this fails the service has no observability.
+    if (!PplLogInit()) {
+        OutputDebugStringA("[RedEdr PPL] main: PplLogInit failed\n");
+        return 1;
+    }
+
     LOG_A(LOG_INFO, "Starting RedEdr PPL Service %s", REDEDR_VERSION);
     
     DWORD result = ServiceEntry();
@@ -161,5 +183,8 @@ int main(INT argc, CHAR** argv)
     }
     
     LOG_A(LOG_INFO, "RedEdr PPL Service terminated");
+
+    // Unregister the ETW provider last, after every LOG_A / LOG_W call.
+    PplLogUninit();
     return result;
 }

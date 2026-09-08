@@ -72,7 +72,10 @@
     <ClCompile Include="pplreader.cpp">
       <Filter>Source Files\input</Filter>
     </ClCompile>
-    <ClCompile Include="logreader.cpp">
+    <ClCompile Include="krnlogreader.cpp">
+      <Filter>Source Files\input</Filter>
+    </ClCompile>
+    <ClCompile Include="ppllogreader.cpp">
       <Filter>Source Files\input</Filter>
     </ClCompile>
     <ClCompile Include="manager.cpp">
@@ -143,7 +146,10 @@
     <ClInclude Include="kernelreader.h">
       <Filter>Header Files\input</Filter>
     </ClInclude>
-    <ClInclude Include="logreader.h">
+    <ClInclude Include="krnlogreader.h">
+      <Filter>Header Files\input</Filter>
+    </ClInclude>
+    <ClInclude Include="ppllogreader.h">
       <Filter>Header Files\input</Filter>
     </ClInclude>
     <ClInclude Include="pplreader.h">

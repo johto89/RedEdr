@@ -1,4 +1,6 @@
 #include <Windows.h>
+#include <iostream>
+#include <filesystem>
 
 #include "control.h"
 #include "emitter.h"
@@ -9,6 +11,13 @@
 #include "piping.h"
 #include "json.hpp"
 #include "process_resolver.h"
+#include "../RedEdrShared/utils.h"
+
+
+namespace fs = std::filesystem;
+
+// Link against Version.lib
+#pragma comment(lib, "Version.lib")
 
 DWORD start_child_process(wchar_t* childCMD);
 
@@ -17,6 +26,164 @@ HANDLE control_thread = NULL;
 volatile BOOL keep_running = TRUE; // Made volatile for thread safety
 
 PipeServer pipeServer = PipeServer("RedEdrPPL Server", (wchar_t*)PPL_SERVICE_PIPE_NAME);
+
+
+// Helper function to extract file version (of a PE/dll)
+std::string GetDllVersion(const fs::path& dllPath) {
+    DWORD dwHandle = 0;
+    DWORD dwSize = GetFileVersionInfoSizeW(dllPath.c_str(), &dwHandle);
+    
+    if (dwSize == 0) return "Unknown";
+
+    std::vector<BYTE> buffer(dwSize);
+    if (!GetFileVersionInfoW(dllPath.c_str(), 0, dwSize, buffer.data())) {
+        return "Unknown";
+    }
+
+    VS_FIXEDFILEINFO* lpFileInfo = nullptr;
+    UINT uiLen = 0;
+    if (!VerQueryValueW(buffer.data(), L"\\", (LPVOID*)&lpFileInfo, &uiLen) || uiLen == 0) {
+        return "Unknown";
+    }
+
+    // Extract major, minor, build, and private parts
+    int major = HIWORD(lpFileInfo->dwFileVersionMS);
+    int minor = LOWORD(lpFileInfo->dwFileVersionMS);
+    int build = HIWORD(lpFileInfo->dwFileVersionLS);
+    int revision = LOWORD(lpFileInfo->dwFileVersionLS);
+
+    return std::to_string(major) + "." + 
+           std::to_string(minor) + "." + 
+           std::to_string(build) + "." + 
+           std::to_string(revision);
+}
+
+
+std::string GetMpengineVersion() {
+    fs::path baseDir = L"C:\\ProgramData\\Microsoft\\Windows Defender\\Definition Updates";
+    fs::path targetDll;
+
+    // 1. Search dynamically for mpengine.dll inside subdirectories
+    // Its in something like: 
+    // C:\ProgramData\Microsoft\Windows Defender\Definition Updates\{26187561-F935-4D14-8C5C-78828BFBE0F6}\mpengine.dll
+    if (fs::exists(baseDir) && fs::is_directory(baseDir)) {
+        for (const auto& entry : fs::recursive_directory_iterator(baseDir)) {
+            if (entry.is_regular_file() && entry.path().filename() == "mpengine.dll") {
+                targetDll = entry.path();
+                break; // Found the active instance
+            }
+        }
+    }
+
+    // 2. Return the found version
+    if (!targetDll.empty()) {
+        LOG_W(LOG_INFO, L"Found mpengine.dll at: %s", targetDll.c_str());
+        return GetDllVersion(targetDll);
+    } else {
+        LOG_A(LOG_WARNING, "mpengine.dll could not be found under the Definition Updates tree.");
+        return "Unknown";
+    }
+}
+
+
+nlohmann::json GetDefenderPlatformInfo() {
+    nlohmann::json info;
+    
+    // Helper lambda to read registry string and convert to narrow string
+    auto readRegString = [](const std::wstring& subKey, const std::wstring& valueName) -> std::string {
+        HKEY hKey;
+        wchar_t buffer[MAX_PATH];
+        DWORD bufferSize = sizeof(buffer);
+
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, subKey.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            if (RegQueryValueExW(hKey, valueName.c_str(), NULL, NULL, (LPBYTE)buffer, &bufferSize) == ERROR_SUCCESS) {
+                RegCloseKey(hKey);
+                return wchar2string(buffer);
+            }
+            RegCloseKey(hKey);
+        }
+        return "";
+    };
+
+    info["as_signature_version"] = readRegString(L"SOFTWARE\\Microsoft\\Windows Defender\\Signature Updates", L"ASSignatureVersion");
+    info["av_signature_version"] = readRegString(L"SOFTWARE\\Microsoft\\Windows Defender\\Signature Updates", L"AVSignatureVersion");
+    info["install_location"] = readRegString(L"SOFTWARE\\Microsoft\\Windows Defender", L"InstallLocation");
+    
+    return info;
+}
+
+
+void SendDefenderInfos() {
+    // List of processes to gather module info from
+    const wchar_t* target_processes[] = {L"MsMpEng.exe", L"MsSense.exe"};
+    
+    for (const wchar_t* process_name : target_processes) {
+        DWORD pid = FindProcessIdByName(process_name);
+        if (pid != 0) {
+            Process* process = g_ProcessResolver.getObject(pid);
+            if (process) {
+                LOG_W(LOG_INFO, L"Control: Found %s (PID: %lu) in resolver", process_name, pid);
+                
+                // Augment process info if not already done
+                if (!process->augmented) {
+                    if (process->AugmentInfo()) {
+                        process->augmented = TRUE;
+                    } else {
+                        LOG_W(LOG_ERROR, L"Control: Failed to augment %s process info", process_name);
+                    }
+                }
+                
+                nlohmann::json modules_array = nlohmann::json::array();
+                for (const auto& mod : process->processLoadedDlls) {
+                    nlohmann::json mod_info;
+
+                    // Only dll filename not full path
+                    std::string mod_name = mod.name;
+                    size_t pos = mod_name.find_last_of("\\/");
+                    if (pos != std::string::npos) {
+                        mod_name = mod_name.substr(pos + 1);
+                    }
+
+                    mod_info["name"] = mod_name;
+                    mod_info["base"] = mod.dll_base;
+                    mod_info["size"] = mod.size;
+                    modules_array.push_back(mod_info);
+                }
+                
+                // Send event with process modules
+                nlohmann::json modules_event;
+                modules_event["event"] = "process_modules";
+                modules_event["type"] = "meta";
+                modules_event["pid"] = pid;
+                modules_event["event_time"] = get_time();
+                modules_event["process_name"] = wchar2string(process_name);
+                modules_event["modules"] = modules_array;
+                
+                SendEmitterPipe((char*)modules_event.dump().c_str());
+            } else {
+                LOG_W(LOG_ERROR, L"Control: Failed to get %s process from resolver", process_name);
+            }
+        } else {
+            LOG_W(LOG_WARNING, L"Control: %s process not found", process_name);
+        }
+    }
+
+    // Send separate event with Defender platform info (only once, not per process)
+    DWORD msmpeng_pid = FindProcessIdByName(L"MsMpEng.exe");
+    if (msmpeng_pid != 0) {
+        nlohmann::json platform_event;
+        platform_event["event"] = "defender_platform_info";
+        platform_event["type"] = "meta";
+        platform_event["pid"] = msmpeng_pid;
+        platform_event["event_time"] = get_time();
+        nlohmann::json platform_info = GetDefenderPlatformInfo();
+        platform_event["as_signature_version"] = platform_info["as_signature_version"];
+        platform_event["av_signature_version"] = platform_info["av_signature_version"];
+        platform_event["install_location"] = platform_info["install_location"];
+        platform_event["mpengine_version"] = GetMpengineVersion();
+        SendEmitterPipe((char*)platform_event.dump().c_str());
+    }
+}
 
 
 DWORD WINAPI ServiceControlPipeThread(LPVOID param) {
@@ -60,12 +227,12 @@ DWORD WINAPI ServiceControlPipeThread(LPVOID param) {
                             g_ProcessResolver.RefreshTargetMatching();
 
                             BOOL doDefenderTrace = j.value("do_defendertrace", false) ? TRUE : FALSE;
-                            SetDefenderTraceConfig(doDefenderTrace, targets);
+                            SetDefenderTraceConfig(doDefenderTrace);
 
-                            nlohmann::json start_event;
-                            start_event["event"] = "ppl_start";
-                            start_event["type"] = "meta";
-                            SendEmitterPipe((char *) start_event.dump().c_str());
+                            if (doDefenderTrace) {
+                                // Send on each new start command
+                                SendDefenderInfos();
+                            }
                         } else {
                             LOG_A(LOG_ERROR, "Control: Start command missing 'targets' array");
                         }

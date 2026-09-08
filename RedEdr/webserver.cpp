@@ -1,6 +1,7 @@
 #include <iostream>
 #include <vector>
 #include <atomic>
+#include <sstream>
 #include <windows.h>
 
 #include "httplib.h" // Needs to be on top?
@@ -92,21 +93,6 @@ std::string getRecordingsAsJson() {
 }
 
 
-std::vector<std::string> GetPplLogs() {
-    std::vector<std::string> logs;
-    std::ifstream file("C:\\RedEdr\\pplservice.log");
-    if (!file.is_open()) {
-        return logs;
-    }
-    std::string line;
-    while (std::getline(file, line)) {
-        if (!line.empty()) {
-            logs.push_back(line);
-        }
-    }
-    file.close();
-    return logs;
-}
 
 bool HasAllowedExtension(const std::string& filename, const std::vector<std::string>& extensions) {
     for (const auto& ext : extensions) {
@@ -179,6 +165,15 @@ DWORD WINAPI WebserverThread(LPVOID param) {
         };
         res.set_content(stats.dump(), "application/json; charset=UTF-8");
     });
+    svr.Get("/api/version", [](const httplib::Request&, httplib::Response& res) {
+        std::string build_date = __DATE__;
+        std::string build_time = __TIME__;
+        nlohmann::json version = {
+            {"build_date", build_date},
+            {"build_time", build_time}
+        };
+        res.set_content(version.dump(), "application/json; charset=UTF-8");
+    });
 
     // Provide Logs
     svr.Get("/api/logs/rededr", [](const httplib::Request&, httplib::Response& res) {
@@ -223,14 +218,10 @@ DWORD WINAPI WebserverThread(LPVOID param) {
             ]
         */
         std::vector agentLogs = GetAgentLogs(); // List of srings
-        std::vector pplLogs = GetPplLogs();
 
 		// return both logs in a single array
 		json response = json::array();
 		for (const auto& log : agentLogs) {
-			response.push_back(log);
-		}
-		for (const auto& log : pplLogs) {
 			response.push_back(log);
 		}
         res.set_content(response.dump(), "application/json");

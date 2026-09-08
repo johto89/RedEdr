@@ -41,7 +41,7 @@ void EventProcessor::init() {
 	nlohmann::json j;
 	j["type"] = "meta";
     j["func"] = "init";
-	j["date"] = get_time_for_file();
+	j["event_time"] = get_time();
     j["version"] = REDEDR_VERSION;
 	j["trace_id"] = trace_id;
 
@@ -50,6 +50,8 @@ void EventProcessor::init() {
 	j["do_kernel"] = g_Config.do_kernel;
 	j["do_hook"] = g_Config.do_hook;
 	j["do_hook_callstack"] = g_Config.do_dllinjection_ucallstack;
+	j["do_defendertrace"] = g_Config.do_defendertrace;
+	j["do_antimalwareengine"] = g_Config.do_antimalwareengine;
 	    
 	j["targets"] = g_Config.targetProcessNames;
     json_entries.push_back(j);
@@ -59,46 +61,51 @@ void EventProcessor::init() {
 void EventProcessor::LogInitialProcessInfo(Process *process) {
     // Log: Peb Info
     ProcessPebInfoRet processPebInfoRet = process->processPebInfoRet;
-    try {
-        nlohmann::json j;
-		j["pid"] = process->id;
-        j["type"] = "process_query";
-        j["func"] = "peb";
-        j["time"] = get_time();
-        j["id"] = process->id;
-        j["parent_pid"] = processPebInfoRet.parent_pid;
-        j["image_path"] = processPebInfoRet.image_path;
-        j["commandline"] = processPebInfoRet.commandline;
-        j["working_dir"] = processPebInfoRet.working_dir;
-        j["is_debugged"] = processPebInfoRet.is_debugged;
-        j["is_protected_process"] = processPebInfoRet.is_protected_process;
-        j["is_protected_process_light"] = processPebInfoRet.is_protected_process_light;
-        j["image_base"] = processPebInfoRet.image_base;
-        g_EventAggregator.NewEvent(j.dump());
-    }
-    catch (const std::exception& e) {
-        LOG_A(LOG_ERROR, "EventProcessor: Error creating PEB info JSON: %s", e.what());
+    if (!processPebInfoRet.image_path.empty()) {
+        try {
+            nlohmann::json j;
+            j["pid"] = process->id;
+            j["type"] = "process_query";
+            j["func"] = "peb";
+            j["event_time"] = get_time();
+            j["id"] = process->id;
+            j["parent_pid"] = processPebInfoRet.parent_pid;
+            j["image_path"] = processPebInfoRet.image_path;
+            j["commandline"] = processPebInfoRet.commandline;
+            j["working_dir"] = processPebInfoRet.working_dir;
+            j["is_debugged"] = processPebInfoRet.is_debugged;
+            j["is_protected_process"] = processPebInfoRet.is_protected_process;
+            j["is_protected_process_light"] = processPebInfoRet.is_protected_process_light;
+            j["image_base"] = processPebInfoRet.image_base;
+            g_EventAggregator.NewEvent(j.dump());
+        }
+        catch (const std::exception& e) {
+            LOG_A(LOG_ERROR, "EventProcessor: Error creating PEB info JSON: %s", e.what());
+        }
     }
 
     // Log: Loaded Modules Info
     try {
         std::vector<ProcessLoadedDll> processLoadedDlls = process->processLoadedDlls;
-        nlohmann::json jDlls;
-        jDlls["func"] = "loaded_dll";
-        jDlls["type"] = "process_query";
-        jDlls["time"] = get_time();
-        jDlls["pid"] = process->id;
-        jDlls["dlls"] = {};
-        for (auto dllEntry : processLoadedDlls) {
-            jDlls["dlls"] += {
-                {"addr", dllEntry.dll_base},
-                {"size", dllEntry.size},
-                {"name", dllEntry.name}
-            };
+        if (!processLoadedDlls.empty()) {
+            nlohmann::json jDlls;
+            jDlls["func"] = "loaded_dll";
+            jDlls["type"] = "process_query";
+            jDlls["event_time"] = get_time();
+            jDlls["pid"] = process->id;
+            jDlls["process_name"] = process->processPebInfoRet.image_path;
+            jDlls["dlls"] = {};
+            for (auto dllEntry : processLoadedDlls) {
+                jDlls["dlls"] += {
+                    {"addr", dllEntry.dll_base},
+                    {"size", dllEntry.size},
+                    {"name", dllEntry.name}
+                };
+            }
+            std::string jsonStr = jDlls.dump();
+            remove_all_occurrences_case_insensitive(jsonStr, "C:\\\\Windows\\\\system32\\\\");
+            g_EventAggregator.NewEvent(jsonStr);
         }
-        std::string jsonStr = jDlls.dump();
-        remove_all_occurrences_case_insensitive(jsonStr, "C:\\\\Windows\\\\system32\\\\");
-        g_EventAggregator.NewEvent(jsonStr);
     }
     catch (const std::exception& e) {
         LOG_A(LOG_ERROR, "EventProcessor: Error enumerating modules: %s", e.what());
@@ -116,10 +123,25 @@ void EventProcessor::AnalyzeEventJson(nlohmann::json& j) {
             LOG_A(LOG_WARNING, "No type? %s", j.dump().c_str());
             return;
         }
-        //if (!j.contains("pid")) {
-        //    LOG_A(LOG_WARNING, "No pid? %s", j.dump().c_str());
-        //    return;
-        //}
+
+        // Cleanup badly labeled
+        if (j.contains("etw_provider_name") && j["etw_provider_name"] == "Microsoft-Windows-Kernel-Audit-API-Calls") {
+            int etw_event_id = j.value("etw_event_id", -1);
+            switch(etw_event_id) {
+                case 3:
+                    j["event"] = "NtCreateSymbolicLink";
+                    break;
+                case 4:
+                    j["event"] = "PspSetContextThreadInternal";
+                    break;
+                case 5:
+                    j["event"] = "PspLogAuditOpenProcessEvent";
+                    break;
+                case 6:
+                    j["event"] = "PspLogAuditOpenThreadEvent";
+                    break;
+            }
+        }
 
         // Stats (for UI)
         EventStats(j);
@@ -143,6 +165,35 @@ void EventProcessor::AnalyzeEventJson(nlohmann::json& j) {
 
             // Augment the JSON Event with memory info
             AugmentEventWithMemAddrInfo(j, process);
+        }
+
+        // Handle process_modules event to update ProcessResolver
+        if (j.contains("event") && j["event"] == "process_modules" && j.contains("pid") && j.contains("modules")) {
+            DWORD pid = j["pid"];
+            Process* process = g_ProcessResolver.getObject(pid);
+            if (process) {
+                process->processLoadedDlls.clear();
+                process->memStatic.ResetData();
+                for (const auto& mod : j["modules"]) {
+                    ProcessLoadedDll dll;
+                    dll.name = mod.value("name", "");
+                    dll.dll_base = mod.value("base", (uint64_t)0);
+                    dll.size = mod.value("size", (ULONG)0);
+                    process->processLoadedDlls.push_back(dll);
+
+                    // Populate memStatic so stack trace addresses can be resolved
+                    if (dll.dll_base != 0 && dll.size != 0) {
+                        MemoryRegion* memoryRegion = new MemoryRegion(
+                            dll.name,
+                            dll.dll_base,
+                            dll.size,
+                            "r-x");
+                        process->memStatic.AddMemoryRegion(memoryRegion->addr, memoryRegion);
+                    }
+                }
+                process->augmented = TRUE;
+                LOG_A(LOG_INFO, "EventProcessor: Updated ProcessResolver with %zu modules for %s (PID: %lu)", process->processLoadedDlls.size(), process->name.c_str(), pid);
+            }
         }
 
         // Print Event
@@ -218,7 +269,7 @@ void EventProcessor::EventStats(nlohmann::json& j) {
         num_dll += 1;
     }
     else if (j["type"] == "etw") {
-        if (j["etw_provider_name"] == "Microsoft-Windows-Threat-Intelligence") {
+        if (j.contains("etw_provider_name") && j["etw_provider_name"] == "Microsoft-Windows-Threat-Intelligence") {
             num_etwti += 1;
         }
         else {
